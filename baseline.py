@@ -158,6 +158,27 @@ def freeze_batchnorm(model: nn.Module, is_master: bool = True) -> None:
         print("已冻结 BatchNorm")
 
 
+def replace_batchnorm_with_groupnorm(model: nn.Module, num_groups: int = 16, is_master: bool = True) -> nn.Module:
+    """用 GroupNorm 替换 BatchNorm，适配小 batch 训练。"""
+    def _convert(module: nn.Module):
+        for name, child in module.named_children():
+            if isinstance(child, nn.modules.batchnorm._BatchNorm):
+                num_channels = child.num_features
+                groups = min(num_groups, num_channels)
+                while groups > 1 and (num_channels % groups != 0):
+                    groups -= 1
+                gn = nn.GroupNorm(groups, num_channels,
+                                  eps=child.eps, affine=True)
+                setattr(module, name, gn)
+            else:
+                _convert(child)
+
+    _convert(model)
+    if is_master:
+        print("已将 BatchNorm 替换为 GroupNorm")
+    return model
+
+
 def pct_to_class_6(pct: float) -> int:
     """
     将狭窄百分比转换为竞赛规定的 6 分类标签。
@@ -915,7 +936,8 @@ def run_worker(rank, args):
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
     if is_tpu:
-        freeze_batchnorm(model, is_master=is_master)
+        model = replace_batchnorm_with_groupnorm(
+            model, num_groups=16, is_master=is_master)
 
     if (not is_tpu) and (torch.cuda.device_count() > 1):
         if is_master:
