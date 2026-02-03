@@ -468,7 +468,7 @@ class SiameseModel(nn.Module):
             pretrained=True,
             num_classes=0,
             in_chans=1,
-            drop_path_rate=0.2
+            drop_path_rate=0
         )
 
         # 获取 Backbone 输出特征维度
