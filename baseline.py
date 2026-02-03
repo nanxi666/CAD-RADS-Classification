@@ -21,6 +21,8 @@ from sklearn.metrics import accuracy_score, f1_score
 
 import timm
 import warnings
+# 忽略所有警告
+warnings.filterwarnings("ignore")
 
 # -------------------------------------------------------------------------
 # 全局设置与工具函数
