@@ -197,6 +197,26 @@ def pct_to_class_6(pct: float) -> int:
     return 5
 
 
+def compute_class_weights_from_df(df: pd.DataFrame, num_classes: int) -> torch.Tensor:
+    """根据训练集统计类别权重（逆频率），用于处理类别不平衡。"""
+    labels = []
+    if 'multi_Class' in df.columns and df['multi_Class'].notna().any():
+        labels = df['multi_Class'].dropna().astype(int).tolist()
+    else:
+        if 'stenosis_percentage' in df.columns:
+            labels = [pct_to_class_6(
+                float(p)) for p in df['stenosis_percentage'].fillna(0).tolist()]
+    if len(labels) == 0:
+        return torch.ones(num_classes, dtype=torch.float32)
+
+    counts = np.bincount(np.array(labels, dtype=int),
+                         minlength=num_classes).astype(np.float32)
+    counts = np.maximum(counts, 1.0)
+    total = counts.sum()
+    weights = total / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 class EarlyStopping:
     """早停机制（基于验证集宏F1，越大越好）"""
 
@@ -477,7 +497,7 @@ class SiameseModel(nn.Module):
                 d_model=feature_dim,
                 nhead=nhead,
                 dim_feedforward=feature_dim * 4,
-                dropout=0.3,
+                dropout=0.5,
                 batch_first=True,
                 activation="gelu",
             ),
@@ -1009,7 +1029,9 @@ def run_worker(rank, args):
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    class_weights = compute_class_weights_from_df(
+        train_df, args.num_classes).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
     scaler = torch.cuda.amp.GradScaler() if (
         not is_tpu and torch.cuda.is_available()) else None
@@ -1106,7 +1128,7 @@ def run_worker(rank, args):
         if os.path.exists(best_acc_path):
             run_inference(best_acc_path, "test_predictions_acc.csv",
                           test_loader, model, device, args)
-        
+
         best_f1_path = os.path.join(args.output_dir, "best_model_f1.pt")
         if os.path.exists(best_f1_path):
             run_inference(best_f1_path, "test_predictions_f1.csv",
