@@ -467,7 +467,8 @@ class SiameseModel(nn.Module):
             model_name,
             pretrained=True,
             num_classes=0,
-            in_chans=1
+            in_chans=1,
+            drop_path_rate=0.2
         )
 
         # 获取 Backbone 输出特征维度
@@ -881,7 +882,7 @@ def parse_args():
     parser.add_argument('--output_dir', default="./results", help="结果输出目录")
 
     # 模型参数
-    parser.add_argument('--model', default='convnext_tiny',
+    parser.add_argument('--model', default='convnext_small',
                         help='模型架构名称 (支持 timm)')
     parser.add_argument('--num_classes', type=int, default=6, help='分类类别数')
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
