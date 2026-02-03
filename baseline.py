@@ -132,6 +132,21 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def try_enable_sync_batchnorm(model: nn.Module, is_tpu: bool, is_master: bool = True) -> nn.Module:
+    """在 TPU 上尝试启用 SyncBatchNorm，失败则回退原模型。"""
+    if not is_tpu:
+        return model
+    try:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_master:
+            print("已启用 SyncBatchNorm")
+        return model
+    except Exception as exc:
+        if is_master:
+            print(f"SyncBatchNorm 启用失败，保持原 BN: {exc}")
+        return model
+
+
 def pct_to_class_6(pct: float) -> int:
     """
     将狭窄百分比转换为竞赛规定的 6 分类标签。
@@ -851,8 +866,9 @@ def run_worker(rank, args):
     else:
         test_ds = None
 
+    loader_num_workers = 0 if is_tpu else args.num_workers
     loader_args = {'batch_size': args.batch_size,
-                   'num_workers': args.num_workers, 'pin_memory': not is_tpu}
+                   'num_workers': loader_num_workers, 'pin_memory': not is_tpu}
 
     if is_tpu:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -883,6 +899,9 @@ def run_worker(rank, args):
     model = SiameseModel(model_name=args.model,
                          num_classes=args.num_classes, num_views=args.num_views)
 
+    model = try_enable_sync_batchnorm(
+        model, is_tpu=is_tpu, is_master=is_master)
+
     if (not is_tpu) and (torch.cuda.device_count() > 1):
         if is_master:
             print(f"检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel 并行训练")
@@ -890,7 +909,8 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    effective_lr = args.lr * xr.world_size() if is_tpu else args.lr
+    optimizer = optim.Adam(model.parameters(), lr=effective_lr)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     scaler = torch.cuda.amp.GradScaler() if (
