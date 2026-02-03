@@ -827,6 +827,8 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=64, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
+    parser.add_argument('--tpu_lr_scale', type=float, default=0.5,
+                        help='TPU 学习率缩放因子 (默认1.0, 避免自动线性放大)')
     parser.add_argument('--patience', type=int, default=10,
                         help='Early Stopping patience')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
@@ -946,7 +948,7 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    effective_lr = args.lr * xr.world_size() if is_tpu else args.lr
+    effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
