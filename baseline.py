@@ -513,7 +513,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0):
+def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0, grad_accum_steps: int = 1):
     """单轮训练逻辑，支持 MixUp"""
     model.train()
     if TPU_AVAILABLE and device.type == 'xla':
@@ -539,7 +539,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         iter_loader = loader_wrapper
         pbar = None
 
-    for x, y, _, _ in iter_loader:
+    for step, (x, y, _, _) in enumerate(iter_loader):
         x, y = x.to(device), y.to(device)
 
         # Mixup处理
@@ -553,44 +553,41 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             else:
                 outputs = model(x)
                 loss = criterion(outputs, y)
+
+            (loss / grad_accum_steps).backward()
+            if (step + 1) % grad_accum_steps == 0:
+                xm.optimizer_step(optimizer, barrier=True)
+                xm.mark_step()
+                optimizer.zero_grad()
         else:
             if use_mixup:
                 x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
+            else:
+                y_a, y_b, lam = None, None, None
 
-                if scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        outputs = model(x)
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(x)
+                    if use_mixup:
                         loss = mixup_criterion(
                             criterion, outputs, y_a, y_b, lam)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs = model(x)
-                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-                    loss.backward()
-                    optimizer.step()
-            else:
-                if scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        outputs = model(x)
+                    else:
                         loss = criterion(outputs, y)
-                    scaler.scale(loss).backward()
+                scaler.scale(loss / grad_accum_steps).backward()
+                if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
+                    optimizer.zero_grad()
+            else:
+                outputs = model(x)
+                if use_mixup:
+                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
                 else:
-                    outputs = model(x)
                     loss = criterion(outputs, y)
-                    loss.backward()
+                (loss / grad_accum_steps).backward()
+                if (step + 1) % grad_accum_steps == 0:
                     optimizer.step()
-
-        if TPU_AVAILABLE:
-            loss.backward()
-            xm.optimizer_step(optimizer, barrier=True)
-            xm.mark_step()
-            optimizer.zero_grad()
-        else:
-            optimizer.zero_grad()
+                    optimizer.zero_grad()
 
         # 统计指标
         with torch.no_grad():
@@ -613,6 +610,18 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
         if pbar:
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+    if TPU_AVAILABLE and (len(loader) % grad_accum_steps != 0):
+        xm.optimizer_step(optimizer, barrier=True)
+        xm.mark_step()
+        optimizer.zero_grad()
+    elif (not TPU_AVAILABLE) and (len(loader) % grad_accum_steps != 0):
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
 
     if TPU_AVAILABLE:
         if not isinstance(running_loss, torch.Tensor):
@@ -827,7 +836,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=256, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
-    parser.add_argument('--tpu_lr_scale', type=float, default=0.5,
+    parser.add_argument('--tpu_lr_scale', type=float, default=0.25,
                         help='TPU 学习率缩放因子 (默认1.0, 避免自动线性放大)')
     parser.add_argument('--tpu_batch_is_global', action='store_true',
                         help='TPU下将batch_size视为全局batch并自动按world_size切分')
@@ -838,6 +847,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
     parser.add_argument('--mixup_alpha', type=float,
                         default=0, help='MixUp alpha 参数 (0表示禁用)')
+    parser.add_argument('--grad_accum_steps', type=int, default=1,
+                        help='梯度累积步数 (用于降低显存占用)')
 
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
@@ -988,7 +999,8 @@ def run_worker(rank, args):
             train_sampler.set_epoch(epoch)
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, scaler, mixup_alpha=args.mixup_alpha)
+            model, train_loader, optimizer, criterion, device, scaler,
+            mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
