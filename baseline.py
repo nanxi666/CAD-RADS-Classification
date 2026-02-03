@@ -477,7 +477,7 @@ class SiameseModel(nn.Module):
                 d_model=feature_dim,
                 nhead=nhead,
                 dim_feedforward=feature_dim * 4,
-                dropout=0.1,
+                dropout=0.3,
                 batch_first=True,
                 activation="gelu",
             ),
