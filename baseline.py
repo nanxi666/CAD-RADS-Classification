@@ -535,8 +535,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
         if TPU_AVAILABLE:
             loss.backward()
-            optimizer.step()
-            torch_xla.sync()
+            xm.optimizer_step(optimizer, barrier=True)
+            xm.mark_step()
             optimizer.zero_grad()
         else:
             optimizer.zero_grad()
@@ -774,7 +774,7 @@ def parse_args():
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=32, help='批大小')
+    parser.add_argument('--batch_size', type=int, default=32*8, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
     parser.add_argument('--patience', type=int, default=10,
                         help='Early Stopping patience')
@@ -795,7 +795,10 @@ def run_worker(rank, args):
     """统一的训练工作流，支持单机和TPU多进程"""
     is_tpu = (rank is not None) and TPU_AVAILABLE
 
-    seed_everything(args.seed)
+    if TPU_AVAILABLE and (rank is not None):
+        seed_everything(args.seed + int(rank))
+    else:
+        seed_everything(args.seed)
 
     if is_tpu:
         device = torch_xla.device()
