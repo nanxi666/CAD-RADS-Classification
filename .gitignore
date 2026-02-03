@@ -3,3 +3,9 @@ results
 *.pdf
 logs
 test.py
+model
+__pycache__
+trans.py
+test.py
+README_DATASET.md
+.vscode
