@@ -825,10 +825,13 @@ def parse_args():
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=64, help='批大小')
+    parser.add_argument('--batch_size', type=int, default=256, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
     parser.add_argument('--tpu_lr_scale', type=float, default=0.5,
                         help='TPU 学习率缩放因子 (默认1.0, 避免自动线性放大)')
+    parser.add_argument('--tpu_batch_is_global', action='store_true',
+                        help='TPU下将batch_size视为全局batch并自动按world_size切分')
+
     parser.add_argument('--patience', type=int, default=10,
                         help='Early Stopping patience')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
@@ -903,7 +906,15 @@ def run_worker(rank, args):
         test_ds = None
 
     loader_num_workers = 0 if is_tpu else args.num_workers
-    loader_args = {'batch_size': args.batch_size,
+    if is_tpu and args.tpu_batch_is_global:
+        per_core_batch = max(1, args.batch_size // xr.world_size())
+    else:
+        per_core_batch = args.batch_size
+    if is_master and is_tpu:
+        print(
+            f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
+
+    loader_args = {'batch_size': per_core_batch,
                    'num_workers': loader_num_workers, 'pin_memory': not is_tpu}
 
     if is_tpu:
