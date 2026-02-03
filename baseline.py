@@ -147,6 +147,17 @@ def try_enable_sync_batchnorm(model: nn.Module, is_tpu: bool, is_master: bool = 
         return model
 
 
+def freeze_batchnorm(model: nn.Module, is_master: bool = True) -> None:
+    """冻结所有 BN 统计与参数，避免小 batch 下不稳定。"""
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+            for p in m.parameters(recurse=False):
+                p.requires_grad = False
+    if is_master:
+        print("已冻结 BatchNorm")
+
+
 def pct_to_class_6(pct: float) -> int:
     """
     将狭窄百分比转换为竞赛规定的 6 分类标签。
@@ -484,6 +495,8 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0):
     """单轮训练逻辑，支持 MixUp"""
     model.train()
+    if TPU_AVAILABLE and device.type == 'xla':
+        freeze_batchnorm(model, is_master=(xr.global_ordinal() == 0))
     running_loss = 0.0
     correct = 0
     total = 0
@@ -901,6 +914,8 @@ def run_worker(rank, args):
 
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
+    if is_tpu:
+        freeze_batchnorm(model, is_master=is_master)
 
     if (not is_tpu) and (torch.cuda.device_count() > 1):
         if is_master:
