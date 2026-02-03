@@ -203,10 +203,11 @@ class DabangDataset(Dataset):
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=15),  # 增加 +/- 15度旋转
-                T.RandomAffine(degrees=0, translate=(0.1, 0.1),
-                               scale=(0.9, 1.1)),  # 轻微平移和缩放
-                T.ColorJitter(brightness=0.1, contrast=0.1),  # 轻微亮度对比度变化
+                # T.RandomRotation(degrees=15),  # 增加 +/- 15度旋转
+                # T.RandomAffine(degrees=0, translate=(0.1, 0.1),
+                #                scale=(0.9, 1.1)),  # 轻微平移和缩放
+                # T.ColorJitter(brightness=0.1, contrast=0.1),  # 轻微亮度对比度变化
+                # 暂时注释掉，后续根据需要调整
             ])
         else:
             self.aug_transform = None
