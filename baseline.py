@@ -877,6 +877,7 @@ def parse_args():
                         choices=['attention', 'mean', 'max', 'concat'],
                         help='多视图融合策略: attention, mean, max, concat (legacy siamese)')
 
+
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
                         required=False, help='Jupyter kernel file (ignore)')
@@ -981,10 +982,7 @@ def run_worker(rank, args):
 
     # 3. 模型与优化器初始化
     # 使用统一的 AttentionSiameseModel，通过 fusion_type 参数控制
-    # 兼容旧参数 use_attention
     fusion_strategy = args.fusion
-    if args.use_attention:
-        fusion_strategy = 'attention'
 
     if is_master:
         print(f"初始化模型... Backend: {args.model}, Fusion: {fusion_strategy}")
