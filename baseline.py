@@ -1,41 +1,112 @@
-import timm
-import gc
-from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
-from sklearn.model_selection import train_test_split
-from torchvision import transforms as T
-from torch.utils.data import Dataset, DataLoader
-import torch.optim as optim
-import torch.nn as nn
-import torch
-from tqdm import tqdm
-from PIL import Image
-import pandas as pd
-import numpy as np
 import os
 import re
 import random
 import argparse
 import time
 from typing import List, Dict, Tuple
-import warnings
-warnings.filterwarnings("ignore")
 
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+
+import timm
+import warnings
 
 # -------------------------------------------------------------------------
 # 全局设置与工具函数
 # -------------------------------------------------------------------------
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-# Try importing TPU libraries
-try:
-    import torch_xla
 
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla.runtime as xr
-    TPU_AVAILABLE = True
-except ImportError:
+def _configure_warnings():
+    """仅过滤已知可忽略的警告，保留其他重要提示。"""
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*invalid escape sequence.*",
+        category=SyntaxWarning,
+        module=r"torch_xla.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*tensorflow.*torch-xla.*",
+        category=UserWarning,
+        module=r"torch_xla.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Transparent hugepages are not enabled.*",
+        category=UserWarning,
+        module=r"jax.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Use torch_xla\.sync instead xm\.mark_step.*",
+        category=DeprecationWarning,
+    )
+
+
+def _is_tpu_env() -> bool:
+    """判断是否处在 TPU 运行环境。"""
+    tpu_env_keys = (
+        "COLAB_TPU_ADDR",
+        "TPU_NAME",
+        "TPU_IP_ADDRESS",
+        "XRT_TPU_CONFIG",
+        "TPU_WORKER_ID",
+        "TPU_ACCELERATOR_TYPE",
+        "TPU_VISIBLE_DEVICES",
+        "PJRT_DEVICE",
+    )
+    for k in tpu_env_keys:
+        v = os.environ.get(k, "")
+        if v and (k != "PJRT_DEVICE" or v.upper() == "TPU"):
+            return True
+    return False
+
+
+def _try_enable_transparent_hugepages():
+    """尽力启用 Transparent Hugepages；若无权限则静默跳过。"""
+    if os.name != "posix":
+        return
+    thp_path = "/sys/kernel/mm/transparent_hugepage/enabled"
+    if not os.path.exists(thp_path):
+        return
+    try:
+        with open(thp_path, "r", encoding="utf-8") as f:
+            status = f.read()
+        if "[always]" in status:
+            return
+        if os.access(thp_path, os.W_OK):
+            with open(thp_path, "w", encoding="utf-8") as f:
+                f.write("always")
+    except Exception:
+        return
+
+
+_configure_warnings()
+
+if _is_tpu_env():
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        import torch_xla.distributed.parallel_loader as pl
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        import torch_xla.runtime as xr
+        TPU_AVAILABLE = True
+        _try_enable_transparent_hugepages()
+    except ImportError:
+        TPU_AVAILABLE = False
+else:
     TPU_AVAILABLE = False
 
 
@@ -100,7 +171,6 @@ class EarlyStopping:
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
-                # 确保只在 trace_func 允许的情况下打印 (即主进程)
                 self.trace_func(
                     f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
@@ -115,9 +185,6 @@ class EarlyStopping:
         if self.verbose:
             self.trace_func(
                 f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-
-        # 使用全局必须存在的函数 (假设此时已定义)
-        # 或者直接在这里实现类似的逻辑
         if TPU_AVAILABLE:
             if xr.global_ordinal() == 0:
                 cpu_state_dict = {k: v.cpu()
@@ -128,7 +195,6 @@ class EarlyStopping:
             start_state_dict = model.module.state_dict() if isinstance(
                 model, nn.DataParallel) else model.state_dict()
             torch.save(start_state_dict, self.path)
-
         self.val_loss_min = val_loss
 
 
@@ -200,14 +266,10 @@ class DabangDataset(Dataset):
         ])
 
         # 训练集数据增强: 温和增强策略 (水平翻转 + 微旋转 + 平移缩放)
+        # 之前的强增强 (RandomResizedCrop + ColorJitter + Mixup) 导致了欠拟合，这里回退到适度增强
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                # T.RandomRotation(degrees=15),  # 增加 +/- 15度旋转
-                # T.RandomAffine(degrees=0, translate=(0.1, 0.1),
-                #                scale=(0.9, 1.1)),  # 轻微平移和缩放
-                # T.ColorJitter(brightness=0.1, contrast=0.1),  # 轻微亮度对比度变化
-                # 暂时注释掉，后续根据需要调整
             ])
         else:
             self.aug_transform = None
@@ -217,10 +279,8 @@ class DabangDataset(Dataset):
 
     def _load_index(self, df: pd.DataFrame) -> List[Tuple]:
         """构建样本索引列表，提前处理文件查找逻辑。"""
-        # 只在主进程打印
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"正在构建数据集索引 ({len(df)} 样本)...")
-
         samples = []
         for _, row in df.iterrows():
             rid = row.get('record_id', row.get('uniq_ID'))
@@ -380,92 +440,6 @@ class SiameseModel(nn.Module):
         out = self.classifier(combined)
         return out
 
-
-class AttentionPool(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(dim, dim // 2, bias=False),
-            nn.Tanh(),
-            nn.Linear(dim // 2, 1, bias=False),
-            nn.Softmax(dim=1)
-        )
-
-    def forward(self, x):
-        # x: [Batch, Views, Dim]
-        # weights: [Batch, Views, 1]
-        weights = self.attention(x)
-        # weighted_feature: [Batch, Dim]
-        return torch.sum(x * weights, dim=1)
-
-
-class AttentionSiameseModel(nn.Module):
-    """
-    基于多视图特征融合的统一模型框架。
-    支持 Attention / Mean / Max / Concat 等融合方式。
-    """
-
-    def __init__(self, model_name: str, num_classes: int, num_views: int, fusion_type: str = 'attention'):
-        super().__init__()
-        self.num_views = num_views
-        self.fusion_type = fusion_type.lower()
-
-        # Backbone
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=True,
-            num_classes=0,
-            in_chans=1
-        )
-
-        if hasattr(self.backbone, 'num_features'):
-            feature_dim = self.backbone.num_features
-        else:
-            dummy = torch.randn(1, 1, 224, 224)
-            out = self.backbone(dummy)
-            feature_dim = out.shape[1]
-
-        # Fusion Layer
-        if self.fusion_type == 'attention':
-            self.attn_pool = AttentionPool(feature_dim)
-            classifier_input_dim = feature_dim
-        elif self.fusion_type == 'concat':
-            classifier_input_dim = feature_dim * num_views
-        else:
-            # Mean or Max
-            classifier_input_dim = feature_dim
-
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3 if self.fusion_type != 'concat' else 0.5),
-            nn.Linear(classifier_input_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes)
-        )
-
-    def forward(self, x):
-        b, v, h, w = x.shape
-        x = x.view(b * v, 1, h, w)
-        features = self.backbone(x)
-        features = features.view(b, v, -1)
-
-        # Fusion Strategy
-        if self.fusion_type == 'attention':
-            # [Batch, Views, Dim] -> [Batch, Dim]
-            pooled = self.attn_pool(features)
-        elif self.fusion_type == 'mean':
-            pooled = torch.mean(features, dim=1)
-        elif self.fusion_type == 'max':
-            pooled = torch.max(features, dim=1)[0]
-        elif self.fusion_type == 'concat':
-            pooled = features.view(b, -1)
-        else:
-            raise ValueError(f"Unknown fusion type: {self.fusion_type}")
-
-        out = self.classifier(pooled)
-        return out
-
 # -------------------------------------------------------------------------
 # 训练与验证流程
 # -------------------------------------------------------------------------
@@ -490,26 +464,6 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def save_model_safely(model, path):
-    """安全保存模型，尽量减少内存占用"""
-    if TPU_AVAILABLE:
-        # 只在主进程保存
-        if xr.global_ordinal() == 0:
-            try:
-                # 显式将 state_dict 转移到 CPU，然后立刻删除 TPU 引用
-                cpu_state_dict = {k: v.cpu()
-                                  for k, v in model.state_dict().items()}
-                torch.save(cpu_state_dict, path)
-                del cpu_state_dict
-                gc.collect()
-            except Exception as e:
-                print(f"Error saving model: {e}")
-        # TPU 屏障
-        # xm.rendezvous('save_model')
-    else:
-        torch.save(model.state_dict(), path)
-
-
 def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0):
     """单轮训练逻辑，支持 MixUp"""
     model.train()
@@ -519,13 +473,11 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
-        # 在TPU上，需要用ParallelLoader包装器
         loader_wrapper = pl.ParallelLoader(
             loader, [device]).per_device_loader(device)
 
     optimizer.zero_grad()
 
-    # 仅在主进程或非TPU环境显示进度条
     show_pbar = (not TPU_AVAILABLE) or (
         TPU_AVAILABLE and xr.global_ordinal() == 0)
 
@@ -542,7 +494,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # Mixup处理
         use_mixup = (mixup_alpha > 0)
 
-        # TPU上暂时建议不使用 torch.cuda.amp.autocast, 或者使用特定的 amp
         if TPU_AVAILABLE:
             if use_mixup:
                 x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
@@ -569,7 +520,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     loss.backward()
                     optimizer.step()
             else:
-                # 常规训练
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
                         outputs = model(x)
@@ -586,10 +536,9 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if TPU_AVAILABLE:
             loss.backward()
             optimizer.step()
-            xm.mark_step()
+            torch_xla.sync()
             optimizer.zero_grad()
         else:
-            # Non-TPU backward/step handled in the if/else blocks above for mixup/amp
             optimizer.zero_grad()
 
         # 统计指标
@@ -599,8 +548,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             total += y.size(0)
 
             if use_mixup:
-                # Mixup 下的准确率近似计算
-                # 避免 .cpu() 和 .item()以减少 TPU 同步
                 if TPU_AVAILABLE:
                     correct += (lam * predicted.eq(y_a).float().sum() +
                                 (1 - lam) * predicted.eq(y_b).float().sum())
@@ -616,10 +563,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if pbar:
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-    # TPU同步 Metrics
     if TPU_AVAILABLE:
-        # Reduce metrics across cores for accurate logging
-        # 注意: 如果 running_loss 是 tensor，需要确保它在 device 上
         if not isinstance(running_loss, torch.Tensor):
             running_loss = torch.tensor(running_loss, device=device)
         if not isinstance(correct, torch.Tensor):
@@ -632,8 +576,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         correct = t_metrics[1].item()
         total = t_metrics[2].item()
 
-        # TPU world size correction for loader length if needed,
-        # but here we just return mean loss
         loader_len = len(loader) * xr.world_size()
         return running_loss / (loader_len if loader_len > 0 else 1), correct / (total if total > 0 else 1)
 
@@ -641,16 +583,11 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
 
 def validate(model, loader, device, criterion, num_classes=6):
-    """验证集评估逻辑 (支持TPU多核Reduce，增加Kappa和F1)"""
+    """验证集评估逻辑 (支持TPU多核Reduce)"""
     model.eval()
     running_loss = 0.0
-
-    # 用于计算 Kappa 和 F1 的混淆矩阵 [num_classes, num_classes]
-    # Rows: True, Cols: Pred
     confusion_matrix = torch.zeros(
         (num_classes, num_classes), dtype=torch.long, device=device)
-
-    total = 0
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
@@ -668,34 +605,23 @@ def validate(model, loader, device, criterion, num_classes=6):
             outputs = model(x)
             loss = criterion(outputs, y)
 
-            # 累计 Loss
             running_loss += loss.item()
 
-            # 更新混淆矩阵
             _, preds = outputs.max(1)
-            # y和preds都是 [Batch]
-            # 快速计算混淆矩阵的技巧: y * num_classes + preds
-            # 这种方式对于分布式 reduce 非常友好，因为 matrix 很小
             indices = y * num_classes + preds
             batch_conf_mat = torch.bincount(indices, minlength=num_classes**2)
             confusion_matrix += batch_conf_mat.view(num_classes, num_classes)
 
-            total += y.size(0)
-
-    # TPU 同步聚合
     if TPU_AVAILABLE:
         if not isinstance(running_loss, torch.Tensor):
             running_loss = torch.tensor(running_loss, device=device)
 
-        # 聚合 Loss 和 混淆矩阵
-        # xm.all_reduce 支持 list，一次性 reduce 效率更高
         t_metrics = [running_loss, confusion_matrix]
         xm.all_reduce('sum', t_metrics)
 
         global_loss_sum = t_metrics[0].item()
-        global_conf_mat = t_metrics[1].cpu().numpy()  # [6, 6]
+        global_conf_mat = t_metrics[1].cpu().numpy()
 
-        # 计算全局平均 Loss
         total_batches = len(loader) * xr.world_size()
         avg_loss = global_loss_sum / \
             (total_batches if total_batches > 0 else 1)
@@ -704,39 +630,28 @@ def validate(model, loader, device, criterion, num_classes=6):
         avg_loss = running_loss / len(loader)
         global_conf_mat = confusion_matrix.cpu().numpy()
 
-
-
-    # Accuracy: 对角线之和 / 总数
     tp_sum = np.trace(global_conf_mat)
     total_samples = np.sum(global_conf_mat)
     avg_acc = tp_sum / total_samples if total_samples > 0 else 0
 
     y_true_r = np.repeat(np.arange(num_classes), np.sum(
         global_conf_mat, axis=1).astype(int))
-    # y_pred 从混淆矩阵恢复比较麻烦，每一行(True Class i)里，预测为各位 j 的数量
     y_pred_r_list = []
     for i in range(num_classes):
-        # 对于真实类别 i，预测分布为 row i
         row = global_conf_mat[i]
         for j, count in enumerate(row):
             if count > 0:
                 y_pred_r_list.extend([j] * int(count))
-    # 注意: y_true_r 的生成顺序是 0,0,0...1,1,1...
-    # y_pred_r_list生成顺序也是先遍历 True Class 0 里面的各个 Pred j，所以顺序是对齐的
 
     y_pred_r = np.array(y_pred_r_list)
 
-    # 计算 Kappa (Quadratic)
-    kappa = cohen_kappa_score(y_true_r, y_pred_r, weights='quadratic')
-
-    # 计算 F1 Macro
-    f1 = f1_score(y_true_r, y_pred_r, average='macro')
+    f1 = f1_score(y_true_r, y_pred_r, average='macro') if len(
+        y_pred_r) > 0 else 0.0
 
     return {
         'loss': avg_loss,
         'acc': avg_acc,
-        'f1': f1,
-        'kappa': kappa
+        'f1': f1
     }
 
 # -------------------------------------------------------------------------
@@ -767,7 +682,6 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
     if (not TPU_AVAILABLE) or (xr.global_ordinal() == 0):
         print(f"\n正在加载模型进行预测: {model_path}")
 
-    # TPU上load需要注意，最好在cpu load然后to(device)
     model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.to(device)
     model.eval()
@@ -789,7 +703,6 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
             x = x.to(device)
             outputs = model(x)
 
-            # TTA: 水平翻转预测 (最后两个维度是 H, W)
             x_flip = torch.flip(x, dims=[-1])
             outputs_flip = model(x_flip)
             outputs = (outputs + outputs_flip) / 2
@@ -799,18 +712,15 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
 
             for rid, pid, pred, prob in zip(rids, pids, preds, probs):
                 row = {'ID': rid, 'Prediction': pred}
-                # 保存每个类别的概率
                 for i, p in enumerate(prob):
                     row[f'prob_{i}'] = p
                 results.append(row)
 
     if TPU_AVAILABLE:
-        # Save per-process results
         rank = xr.global_ordinal()
         part_csv = os.path.join(args.output_dir, f"part_{rank}_{output_name}")
         pd.DataFrame(results).to_csv(part_csv, index=False)
 
-        # Sync
         xm.rendezvous('inference_save_done')
 
         if rank == 0:
@@ -830,14 +740,12 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
                 full_df.to_csv(out_csv, index=False)
                 print(f"完整预测结果已保存至: {out_csv}")
 
-                # Cleanup
                 for r in range(world_size):
                     fname = os.path.join(
                         args.output_dir, f"part_{r}_{output_name}")
                     if os.path.exists(fname):
                         os.remove(fname)
 
-        # Sync again to prevent others from proceeding before merge is done
         xm.rendezvous('inference_merge_done')
     else:
         out_csv = os.path.join(args.output_dir, output_name)
@@ -865,19 +773,15 @@ def parse_args():
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
 
     # 训练参数
-    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=32, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
-    parser.add_argument('--patience', type=int, default=20,
+    parser.add_argument('--patience', type=int, default=10,
                         help='Early Stopping patience')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
     parser.add_argument('--mixup_alpha', type=float,
                         default=0, help='MixUp alpha 参数 (0表示禁用)')
-    parser.add_argument('--fusion', type=str, default='concat',
-                        choices=['attention', 'mean', 'max', 'concat'],
-                        help='多视图融合策略: attention, mean, max, concat (legacy siamese)')
-
 
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
@@ -891,7 +795,6 @@ def run_worker(rank, args):
     """统一的训练工作流，支持单机和TPU多进程"""
     is_tpu = (rank is not None) and TPU_AVAILABLE
 
-    # 1. 环境初始化
     seed_everything(args.seed)
 
     if is_tpu:
@@ -908,7 +811,6 @@ def run_worker(rank, args):
         dev_id = rank if is_tpu else device
         print(f"当前使用的计算设备: {prefix} {dev_id}")
 
-    # 2. 数据准备
     if is_master:
         print("正在加载数据列表...")
 
@@ -916,29 +818,23 @@ def run_worker(rank, args):
     test_df = pd.read_csv(args.test_csv) if os.path.exists(
         args.test_csv) else pd.DataFrame()
 
-    # PID 提取: 用于按病人划分验证集，防止数据泄漏
     for df in [train_val_df, test_df]:
         if df.empty:
             continue
         if 'pid' not in df.columns:
             col = 'check_id' if 'check_id' in df.columns else 'record_id'
-            # 提取字符串中的数字部分作为 PID
             df['pid'] = df[col].astype(str).apply(lambda x: re.findall(
                 r'\d+', x)[0] if re.findall(r'\d+', x) else x)
 
-    # 划分训练集与验证集 (Ratio 85:15)
     pids = train_val_df['pid'].unique()
     train_pids, val_pids = train_test_split(
         pids, test_size=0.15, random_state=args.seed)
     train_df = train_val_df[train_val_df['pid'].isin(train_pids)].copy()
     val_df = train_val_df[train_val_df['pid'].isin(val_pids)].copy()
 
-    # 处理测试集图像路径 (如果测试集在不同文件夹)
     test_root = args.test_img_root if os.path.exists(
         args.test_img_root) else args.img_root
 
-    # 构建 Dataset
-    # 注意: DabangDataset 内部会根据 global_ordinal 打印日志
     train_ds = DabangDataset(train_df, args.img_root,
                              num_views=args.num_views, augment=True)
     val_ds = DabangDataset(val_df, args.img_root,
@@ -950,13 +846,10 @@ def run_worker(rank, args):
     else:
         test_ds = None
 
-    # 构建 DataLoader
-    # TPU 环境下不需要 pin_memory，甚至可能引发警告
     loader_args = {'batch_size': args.batch_size,
                    'num_workers': args.num_workers, 'pin_memory': not is_tpu}
 
     if is_tpu:
-        # TPU Samplers
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=True)
         val_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -973,27 +866,17 @@ def run_worker(rank, args):
                 test_ds, sampler=test_sampler, **loader_args)
         else:
             test_loader = []
-
     else:
-        # Standard Loaders
         train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
         val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
         test_loader = DataLoader(
             test_ds, shuffle=False, **loader_args) if test_ds else []
 
-    # 3. 模型与优化器初始化
-    # 使用统一的 AttentionSiameseModel，通过 fusion_type 参数控制
-    fusion_strategy = args.fusion
-
     if is_master:
-        print(f"初始化模型... Backend: {args.model}, Fusion: {fusion_strategy}")
+        print(f"初始化 SiameseModel ({args.model}) ...")
 
-    model = AttentionSiameseModel(
-        model_name=args.model,
-        num_classes=args.num_classes,
-        num_views=args.num_views,
-        fusion_type=fusion_strategy
-    )
+    model = SiameseModel(model_name=args.model,
+                         num_classes=args.num_classes, num_views=args.num_views)
 
     if (not is_tpu) and (torch.cuda.device_count() > 1):
         if is_master:
@@ -1002,45 +885,23 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    # 优化器与损失函数
-    # 引入 label_smoothing=0.1 缓解过拟合，对于分类边界模糊的医学图像通常有效
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # Cosine Annealing Scheduler (T_max=epochs)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    # 混合精度 Scaler (非 TPU 环境)
     scaler = torch.cuda.amp.GradScaler() if (
         not is_tpu and torch.cuda.is_available()) else None
 
-    # Helper for Master Printing
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6)
+
     def master_print(*args_p, **kwargs_p):
         if is_master:
             print(*args_p, **kwargs_p)
 
-    # Early Stopping
-    early_stopping = EarlyStopping(
-        patience=args.patience,
-        verbose=True,
-        path=os.path.join(args.output_dir, "best_model_loss.pt"),
-        trace_func=master_print
-    )
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True, path=os.path.join(
+        args.output_dir, "best_model_loss.pt"), trace_func=master_print)
 
-    # TensorBoard & Logging
-    writer = None
-    if is_master:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(
-                log_dir=os.path.join(args.output_dir, "logs"))
-        except ImportError:
-            print("Warning: tensorboard not installed.")
-
-    log_history = []
     best_acc = 0.0
-    best_kappa = -1.0
-    log_csv_path = os.path.join(args.output_dir, "training_log.csv")
 
     if is_master:
         print("开始训练流程...")
@@ -1051,16 +912,12 @@ def run_worker(rank, args):
         if is_tpu:
             train_sampler.set_epoch(epoch)
 
-        # 训练阶段
-        # 注意：num_classes 默认是 args.num_classes，这里假设 validate 函数内部能获取到正确的类别数
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, scaler, mixup_alpha=args.mixup_alpha)
 
-        # 更新学习率
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        # 验证阶段
         val_metrics = validate(model, val_loader, device,
                                criterion, num_classes=args.num_classes)
 
@@ -1069,34 +926,8 @@ def run_worker(rank, args):
         if is_master:
             print(f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
                   f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
-                  f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} "
-                  f"F1={val_metrics['f1']:.4f} Kappa={val_metrics['kappa']:.4f}")
+                  f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}")
 
-            # 记录 CSV 日志
-            log_history.append({
-                'epoch': epoch + 1,
-                'lr': current_lr,
-                'train_loss': train_loss,
-                'train_acc': train_acc,
-                'val_loss': val_metrics['loss'],
-                'val_acc': val_metrics['acc'],
-                'val_f1': val_metrics['f1'],
-                'val_kappa': val_metrics['kappa']
-            })
-            pd.DataFrame(log_history).to_csv(log_csv_path, index=False)
-
-            # 记录 TensorBoard
-            if writer:
-                writer.add_scalar('Loss/train', train_loss, epoch)
-                writer.add_scalar('Accuracy/train', train_acc, epoch)
-                writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
-                writer.add_scalar('Accuracy/val', val_metrics['acc'], epoch)
-                writer.add_scalar('F1/val', val_metrics['f1'], epoch)
-                writer.add_scalar('Kappa/val', val_metrics['kappa'], epoch)
-                writer.add_scalar('LR', current_lr, epoch)
-                writer.flush()
-
-            # 保存最佳模型 (以 Accuracy 为准)
             if val_metrics['acc'] > best_acc:
                 best_acc = val_metrics['acc']
                 save_path = os.path.join(args.output_dir, "best_model.pt")
@@ -1111,24 +942,6 @@ def run_worker(rank, args):
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Acc] 性能提升，模型已保存至: {save_path}")
 
-            # 保存最佳模型 (以 Kappa 为准)
-            if val_metrics['kappa'] > best_kappa:
-                best_kappa = val_metrics['kappa']
-                save_path_kappa = os.path.join(
-                    args.output_dir, "best_model_kappa.pt")
-                if is_tpu:
-                    cpu_state_dict = {k: v.cpu()
-                                      for k, v in model.state_dict().items()}
-                    torch.save(cpu_state_dict, save_path_kappa)
-                    del cpu_state_dict
-                else:
-                    state_dict = model.module.state_dict() if isinstance(
-                        model, nn.DataParallel) else model.state_dict()
-                    torch.save(state_dict, save_path_kappa)
-                print(
-                    f"  >>> [Kappa] 性能提升 ({best_kappa:.4f})，模型已保存至: {save_path_kappa}")
-
-        # Early Stopping Check (Based on Val Loss)
         early_stopping(val_metrics['loss'], model)
 
         stop_flag = False
@@ -1136,7 +949,6 @@ def run_worker(rank, args):
             stop_flag = True
 
         if is_tpu:
-            # Sync stop flag
             flag_tensor = torch.tensor(
                 1 if stop_flag else 0, dtype=torch.int, device=device)
             xm.all_reduce('max', [flag_tensor])
@@ -1147,26 +959,15 @@ def run_worker(rank, args):
                 print("Early stopping triggered!")
             break
 
-    if is_master and writer:
-        writer.close()
-
     if test_loader:
         if is_master:
             print("\n开始测试集预测...")
 
-        # 1. 预测 Best Accuracy 模型
         best_acc_path = os.path.join(args.output_dir, "best_model.pt")
         if os.path.exists(best_acc_path):
             run_inference(best_acc_path, "test_predictions_acc.csv",
                           test_loader, model, device, args)
 
-        # 2. 预测 Best Kappa 模型
-        best_kappa_path = os.path.join(args.output_dir, "best_model_kappa.pt")
-        if os.path.exists(best_kappa_path):
-            run_inference(best_kappa_path, "test_predictions_kappa.csv",
-                          test_loader, model, device, args)
-
-        # 3. 预测 Best Loss 模型
         best_loss_path = os.path.join(args.output_dir, "best_model_loss.pt")
         if os.path.exists(best_loss_path):
             run_inference(best_loss_path, "test_predictions_loss.csv",
@@ -1178,7 +979,6 @@ def main():
 
     if TPU_AVAILABLE:
         print("检测到 TPU 环境，启动多进程训练...")
-        # 环境变量清理
         os.environ.pop('TPU_PROCESS_ADDRESSES', None)
         os.environ.pop('TPU_MESH_CONTROLLER_ADDRESS', None)
         os.environ.pop('TPU_MESH_CONTROLLER_PORT', None)
