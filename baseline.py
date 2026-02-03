@@ -198,7 +198,7 @@ def pct_to_class_6(pct: float) -> int:
 
 
 class EarlyStopping:
-    """早停机制"""
+    """早停机制（基于验证集宏F1，越大越好）"""
 
     def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
         self.patience = patience
@@ -206,17 +206,17 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.inf
+        self.best_metric = -np.inf
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
 
-    def __call__(self, val_loss, model):
-        score = -val_loss
+    def __call__(self, val_f1, model):
+        score = val_f1
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(val_f1, model)
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
@@ -226,14 +226,14 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(val_f1, model)
             self.counter = 0
 
-    def save_checkpoint(self, val_loss, model):
-        '''验证集损失下降时保存模型'''
+    def save_checkpoint(self, val_f1, model):
+        '''验证集宏F1提升时保存模型'''
         if self.verbose:
             self.trace_func(
-                f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+                f'Validation F1 increased ({self.best_metric:.6f} --> {val_f1:.6f}).  Saving model ...')
         if TPU_AVAILABLE:
             if xr.global_ordinal() == 0:
                 cpu_state_dict = {k: v.cpu()
@@ -244,7 +244,7 @@ class EarlyStopping:
             start_state_dict = model.module.state_dict() if isinstance(
                 model, nn.DataParallel) else model.state_dict()
             torch.save(start_state_dict, self.path)
-        self.val_loss_min = val_loss
+        self.best_metric = val_f1
 
 
 def find_multiview_images(image_root: str, record_id: str, cache: Dict[str, List[str]] = {}) -> List[str]:
@@ -833,7 +833,7 @@ def parse_args():
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
 
     # 训练参数
-    parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
+    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=256, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
     parser.add_argument('--tpu_lr_scale', type=float, default=0.25,
@@ -841,7 +841,7 @@ def parse_args():
     parser.add_argument('--tpu_batch_is_global', action='store_true',
                         help='TPU下将batch_size视为全局batch并自动按world_size切分')
 
-    parser.add_argument('--patience', type=int, default=10,
+    parser.add_argument('--patience', type=int, default=20,
                         help='Early Stopping patience')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
@@ -985,7 +985,7 @@ def run_worker(rank, args):
             print(*args_p, **kwargs_p)
 
     early_stopping = EarlyStopping(patience=args.patience, verbose=True, path=os.path.join(
-        args.output_dir, "best_model_loss.pt"), trace_func=master_print)
+        args.output_dir, "best_model_f1.pt"), trace_func=master_print)
 
     best_acc = 0.0
 
@@ -1029,7 +1029,7 @@ def run_worker(rank, args):
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Acc] 性能提升，模型已保存至: {save_path}")
 
-        early_stopping(val_metrics['loss'], model)
+        early_stopping(val_metrics['f1'], model)
 
         stop_flag = False
         if early_stopping.early_stop:
