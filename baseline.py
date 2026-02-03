@@ -431,6 +431,7 @@ class SiameseModel(nn.Module):
     基于 Siamese 网络的特征融合模型。
     每个视角共用同一个 Backbone 提取特征，随后融合特征进行分类。
     使用 ImageNet 预训练权重。
+    视图融合：Transformer Encoder (视图级序列建模)。
     """
 
     def __init__(self, model_name: str, num_classes: int, num_views: int):
@@ -457,11 +458,32 @@ class SiameseModel(nn.Module):
             out = self.backbone(dummy)
             feature_dim = out.shape[1]
 
-        # 2. 特征融合层与分类头
-        # 融合策略: Flatten all views -> num_views * feature_dim
+        # 2. 视图级 Transformer 融合
+        self.view_pos = nn.Parameter(torch.zeros(1, num_views, feature_dim))
+
+        def _pick_nhead(dim: int, max_head: int = 8) -> int:
+            head = min(max_head, dim)
+            while head > 1 and dim % head != 0:
+                head -= 1
+            return head
+
+        nhead = _pick_nhead(feature_dim, max_head=8)
+        self.view_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=feature_dim,
+                nhead=nhead,
+                dim_feedforward=feature_dim * 4,
+                dropout=0.1,
+                batch_first=True,
+                activation="gelu",
+            ),
+            num_layers=2,
+        )
+
+        # 3. 分类头 (输入为融合后的 feature_dim)
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(feature_dim * num_views, 512),
+            nn.Linear(feature_dim, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(512, num_classes)
@@ -481,12 +503,13 @@ class SiameseModel(nn.Module):
         # 3. 还原维度 -> [Batch, Views, Feature_Dim]
         features = features.view(b, v, -1)
 
-        # 4. 特征融合 (Aggregation)
-        # Flatten: [Batch, Views, Feature_Dim] -> [Batch, Views * Feature_Dim]
-        combined = features.view(b, -1)
+        # 4. Transformer 视图融合
+        features = features + self.view_pos
+        fused = self.view_encoder(features)
+        pooled = fused.mean(dim=1)
 
         # 5. 分类
-        out = self.classifier(combined)
+        out = self.classifier(pooled)
         return out
 
 # -------------------------------------------------------------------------
