@@ -434,9 +434,10 @@ class SiameseModel(nn.Module):
     视图融合：Transformer Encoder (视图级序列建模)。
     """
 
-    def __init__(self, model_name: str, num_classes: int, num_views: int):
+    def __init__(self, model_name: str, num_classes: int, num_views: int, use_cls_token: bool = False):
         super().__init__()
         self.num_views = num_views
+        self.use_cls_token = use_cls_token
 
         # 1. 创建共享的 Backbone (Siamese Network)
         # in_chans=1: 因为输入是单通道灰度图
@@ -459,7 +460,10 @@ class SiameseModel(nn.Module):
             feature_dim = out.shape[1]
 
         # 2. 视图级 Transformer 融合
-        self.view_pos = nn.Parameter(torch.zeros(1, num_views, feature_dim))
+        token_len = num_views + (1 if self.use_cls_token else 0)
+        self.view_pos = nn.Parameter(torch.zeros(1, token_len, feature_dim))
+        if self.use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, feature_dim))
 
         def _pick_nhead(dim: int, max_head: int = 8) -> int:
             head = min(max_head, dim)
@@ -504,9 +508,16 @@ class SiameseModel(nn.Module):
         features = features.view(b, v, -1)
 
         # 4. Transformer 视图融合
+        if self.use_cls_token:
+            cls_tok = self.cls_token.expand(b, -1, -1)
+            features = torch.cat([cls_tok, features], dim=1)
+
         features = features + self.view_pos
         fused = self.view_encoder(features)
-        pooled = fused.mean(dim=1)
+        if self.use_cls_token:
+            pooled = fused[:, 0]
+        else:
+            pooled = fused.mean(dim=1)
 
         # 5. 分类
         out = self.classifier(pooled)
@@ -854,6 +865,8 @@ def parse_args():
                         help='模型架构名称 (支持 timm)')
     parser.add_argument('--num_classes', type=int, default=6, help='分类类别数')
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
+    parser.add_argument('--use_cls_token', action='store_true',
+                        help='Transformer 融合时使用 CLS token 池化')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -978,7 +991,8 @@ def run_worker(rank, args):
         print(f"初始化 SiameseModel ({args.model}) ...")
 
     model = SiameseModel(model_name=args.model,
-                         num_classes=args.num_classes, num_views=args.num_views)
+                         num_classes=args.num_classes, num_views=args.num_views,
+                         use_cls_token=args.use_cls_token)
 
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
@@ -1011,6 +1025,7 @@ def run_worker(rank, args):
         args.output_dir, "best_model_f1.pt"), trace_func=master_print)
 
     best_acc = 0.0
+    best_loss = float('inf')
 
     if is_master:
         print("开始训练流程...")
@@ -1052,6 +1067,20 @@ def run_worker(rank, args):
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Acc] 性能提升，模型已保存至: {save_path}")
 
+            if val_metrics['loss'] < best_loss:
+                best_loss = val_metrics['loss']
+                save_path = os.path.join(args.output_dir, "best_model_loss.pt")
+                if is_tpu:
+                    cpu_state_dict = {k: v.cpu()
+                                      for k, v in model.state_dict().items()}
+                    torch.save(cpu_state_dict, save_path)
+                    del cpu_state_dict
+                else:
+                    state_dict = model.module.state_dict() if isinstance(
+                        model, nn.DataParallel) else model.state_dict()
+                    torch.save(state_dict, save_path)
+                print(f"  >>> [Loss] 性能提升，模型已保存至: {save_path}")
+
         early_stopping(val_metrics['f1'], model)
 
         stop_flag = False
@@ -1076,6 +1105,11 @@ def run_worker(rank, args):
         best_acc_path = os.path.join(args.output_dir, "best_model.pt")
         if os.path.exists(best_acc_path):
             run_inference(best_acc_path, "test_predictions_acc.csv",
+                          test_loader, model, device, args)
+        
+        best_f1_path = os.path.join(args.output_dir, "best_model_f1.pt")
+        if os.path.exists(best_f1_path):
+            run_inference(best_f1_path, "test_predictions_f1.csv",
                           test_loader, model, device, args)
 
         best_loss_path = os.path.join(args.output_dir, "best_model_loss.pt")
