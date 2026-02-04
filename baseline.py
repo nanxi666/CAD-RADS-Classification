@@ -179,6 +179,25 @@ def replace_batchnorm_with_groupnorm(model: nn.Module, num_groups: int = 16, is_
     return model
 
 
+def print_model_parameters(model: nn.Module, is_master: bool = True) -> None:
+    """打印模型参数名称、形状与数量统计。"""
+    if not is_master:
+        return
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    total_params = 0
+    trainable_params = 0
+    print("模型参数:")
+    for name, param in base_model.named_parameters():
+        numel = param.numel()
+        total_params += numel
+        if param.requires_grad:
+            trainable_params += numel
+        print(
+            f"{name}: shape={tuple(param.shape)} numel={numel} trainable={param.requires_grad}")
+    print(
+        f"Total params: {total_params:,} | Trainable: {trainable_params:,} | Non-trainable: {total_params - trainable_params:,}")
+
+
 def pct_to_class_6(pct: float) -> int:
     """
     将狭窄百分比转换为竞赛规定的 6 分类标签。
@@ -334,11 +353,19 @@ class DabangDataset(Dataset):
             T.Normalize(mean=[0.5], std=[0.5])
         ])
 
-        # 训练集数据增强: 温和增强策略 (水平翻转 + 微旋转 + 平移缩放)
-        # 之前的强增强 (RandomResizedCrop + ColorJitter + Mixup) 导致了欠拟合，这里回退到适度增强
+        # 训练集数据增强: 针对 CPR 灰度图的温和几何与强度扰动
+        # 注意：避免过强形变，保持血管结构一致性
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
+                T.RandomRotation(degrees=10),
+                T.RandomAffine(degrees=0, translate=(
+                    0.05, 0.05), scale=(0.9, 1.1)),
+                T.RandomApply(
+                    [T.ColorJitter(brightness=0.15, contrast=0.15)], p=0.5),
+                T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
+                T.RandomApply(
+                    [T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
             ])
         else:
             self.aug_transform = None
@@ -882,7 +909,7 @@ def parse_args():
     parser.add_argument('--output_dir', default="./results", help="结果输出目录")
 
     # 模型参数
-    parser.add_argument('--model', default='convnext_small',
+    parser.add_argument('--model', default='convnext_tiny',
                         help='模型架构名称 (支持 timm)')
     parser.add_argument('--num_classes', type=int, default=6, help='分类类别数')
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
@@ -1029,6 +1056,8 @@ def run_worker(rank, args):
         model = nn.DataParallel(model)
 
     model.to(device)
+
+    print_model_parameters(model, is_master=is_master)
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
