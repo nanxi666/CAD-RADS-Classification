@@ -376,14 +376,6 @@ class DabangDataset(Dataset):
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
                 T.RandomRotation(degrees=5),
-                T.RandomAffine(degrees=0, translate=(
-                    0.05, 0.05), scale=(0.9, 1.1)),
-                T.RandomApply(
-                    [T.ColorJitter(brightness=0.1, contrast=0.1)], p=0.5),
-                T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
-                T.RandomApply(
-                    [T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
-
             ])
         else:
             self.aug_transform = None
@@ -1097,7 +1089,7 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    print_model_parameters(model, is_master=is_master)
+    # print_model_parameters(model, is_master=is_master)
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
