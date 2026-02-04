@@ -181,24 +181,6 @@ def replace_batchnorm_with_groupnorm(model: nn.Module, num_groups: int = 16, is_
     return model
 
 
-def print_model_parameters(model: nn.Module, is_master: bool = True) -> None:
-    """打印模型参数名称、形状与数量统计。"""
-    if not is_master:
-        return
-    base_model = model.module if isinstance(model, nn.DataParallel) else model
-    total_params = 0
-    trainable_params = 0
-    print("模型参数:")
-    for name, param in base_model.named_parameters():
-        numel = param.numel()
-        total_params += numel
-        if param.requires_grad:
-            trainable_params += numel
-        print(
-            f"{name}: shape={tuple(param.shape)} numel={numel} trainable={param.requires_grad}")
-    print(
-        f"Total params: {total_params:,} | Trainable: {trainable_params:,} | Non-trainable: {total_params - trainable_params:,}")
-
 
 def pct_to_class_6(pct: float) -> int:
     """
@@ -361,6 +343,11 @@ class DabangDataset(Dataset):
         self.image_root = image_root
         self.num_views = num_views
         self.is_test = is_test
+        self.vessel_map = {
+            'LAD': 1,
+            'LCX': 2,
+            'RCA': 3,
+        }
 
         # 基础图像预处理: 调整大小 -> 转张量 -> 归一化
         # 假设输入为灰度图 (单通道)，使用 mean=0.5, std=0.5 进行各种归一化
@@ -419,7 +406,9 @@ class DabangDataset(Dataset):
 
             paths = [os.path.join(self.image_root, f) for f in img_files]
             pid = str(row.get('pid', rid)).strip()
-            samples.append((paths, label, rid, pid))
+            vessel_code = str(row.get('vessel_code', '')).upper().strip()
+            vessel_idx = self.vessel_map.get(vessel_code, 0)
+            samples.append((paths, label, vessel_idx, rid, pid))
 
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"索引构建完成，有效样本数: {len(samples)}")
@@ -429,7 +418,7 @@ class DabangDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, label, rid, pid = self.samples[idx]
+        paths, label, vessel_idx, rid, pid = self.samples[idx]
         tensors = []
 
         for p in paths:
@@ -451,7 +440,7 @@ class DabangDataset(Dataset):
         # 输入: List of [1, H, W] -> Output: [num_views, H, W]
         # 注意: 这里假设是单通道图片。如果是RGB，通道数需 x3
         x = torch.cat(tensors, dim=0)
-        return x, label, rid, pid
+        return x, label, vessel_idx, rid, pid
 
 # -------------------------------------------------------------------------
 # 模型定义
@@ -491,10 +480,13 @@ class SiameseModel(nn.Module):
     视图融合：Transformer Encoder (视图级序列建模)。
     """
 
-    def __init__(self, model_name: str, num_classes: int, num_views: int, use_cls_token: bool = False):
+    def __init__(self, model_name: str, num_classes: int, num_views: int,
+                 use_cls_token: bool = False, use_vessel_code: bool = False, vessel_emb_dim: int = 16):
         super().__init__()
         self.num_views = num_views
         self.use_cls_token = use_cls_token
+        self.use_vessel_code = use_vessel_code
+        self.vessel_emb_dim = vessel_emb_dim
 
         # 1. 创建共享的 Backbone (Siamese Network)
         # in_chans=1: 因为输入是单通道灰度图
@@ -542,16 +534,22 @@ class SiameseModel(nn.Module):
             num_layers=2,
         )
 
-        # 3. 分类头 (输入为融合后的 feature_dim)
+        # 3. vessel_code 条件向量
+        if self.use_vessel_code:
+            # 0=unknown, 1=LAD, 2=LCX, 3=RCA
+            self.vessel_emb = nn.Embedding(4, vessel_emb_dim)
+
+        # 4. 分类头 (输入为融合后的 feature_dim [+ vessel_emb_dim])
+        in_dim = feature_dim + (vessel_emb_dim if self.use_vessel_code else 0)
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(feature_dim, 512),
+            nn.Linear(in_dim, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x, vessel_idx=None):
         # x shape: [Batch, Views, H, W] -> [B, 8, 224, 224]
         b, v, h, w = x.shape
 
@@ -577,7 +575,18 @@ class SiameseModel(nn.Module):
         else:
             pooled = fused.mean(dim=1)
 
-        # 5. 分类
+        # 5. 拼接 vessel_code 条件向量
+        if self.use_vessel_code:
+            if vessel_idx is None:
+                vessel_feat = torch.zeros(
+                    (b, self.vessel_emb_dim), device=pooled.device)
+            else:
+                vessel_idx = vessel_idx.to(
+                    pooled.device).long().clamp(min=0, max=3)
+                vessel_feat = self.vessel_emb(vessel_idx)
+            pooled = torch.cat([pooled, vessel_feat], dim=1)
+
+        # 6. 分类
         out = self.classifier(pooled)
         return out
 
@@ -638,7 +647,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if (swa_model is not None) and (epoch >= swa_start):
             swa_model.update_parameters(model)
 
-    for step, (x, y, _, _) in enumerate(iter_loader):
+    for step, (x, y, vessel_idx, _, _) in enumerate(iter_loader):
         x, y = x.to(device), y.to(device)
 
         # Mixup处理
@@ -647,10 +656,10 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if TPU_AVAILABLE:
             if use_mixup:
                 x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
-                outputs = model(x)
+                outputs = model(x, vessel_idx)
                 loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
             else:
-                outputs = model(x)
+                outputs = model(x, vessel_idx)
                 loss = criterion(outputs, y)
 
             (loss / grad_accum_steps).backward()
@@ -667,7 +676,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    outputs = model(x)
+                    outputs = model(x, vessel_idx)
                     if use_mixup:
                         loss = mixup_criterion(
                             criterion, outputs, y_a, y_b, lam)
@@ -680,7 +689,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     _update_ema_swa()
                     optimizer.zero_grad()
             else:
-                outputs = model(x)
+                outputs = model(x, vessel_idx)
                 if use_mixup:
                     loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
                 else:
@@ -764,9 +773,9 @@ def validate(model, loader, device, criterion, num_classes=6):
                        leave=False) if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, y, _, _ in iter_loader:
+        for x, y, vessel_idx, _, _ in iter_loader:
             x, y = x.to(device), y.to(device)
-            outputs = model(x)
+            outputs = model(x, vessel_idx)
             loss = criterion(outputs, y)
 
             running_loss += loss.item()
@@ -863,12 +872,12 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
         loader_wrapper, desc=f"Inference ({output_name})") if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, _, rids, pids in iter_loader:
+        for x, _, vessel_idx, rids, pids in iter_loader:
             x = x.to(device)
-            outputs = model(x)
+            outputs = model(x, vessel_idx)
 
             x_flip = torch.flip(x, dims=[-1])
-            outputs_flip = model(x_flip)
+            outputs_flip = model(x_flip, vessel_idx)
             outputs = (outputs + outputs_flip) / 2
 
             probs = torch.softmax(outputs, dim=1).cpu().numpy()
@@ -937,6 +946,10 @@ def parse_args():
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
     parser.add_argument('--use_cls_token', action='store_true',
                         help='Transformer 融合时使用 CLS token 池化')
+    parser.add_argument('--use_vessel_code', action='store_true',
+                        help='使用 vessel_code 条件向量')
+    parser.add_argument('--vessel_emb_dim', type=int, default=16,
+                        help='vessel_code 嵌入维度')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -1074,7 +1087,9 @@ def run_worker(rank, args):
 
     model = SiameseModel(model_name=args.model,
                          num_classes=args.num_classes, num_views=args.num_views,
-                         use_cls_token=args.use_cls_token)
+                         use_cls_token=args.use_cls_token,
+                         use_vessel_code=args.use_vessel_code,
+                         vessel_emb_dim=args.vessel_emb_dim)
 
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
@@ -1089,7 +1104,7 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    # print_model_parameters(model, is_master=is_master)
+
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
