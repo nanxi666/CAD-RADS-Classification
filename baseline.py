@@ -817,8 +817,13 @@ def validate(model, loader, device, criterion, num_classes=6):
 
     y_pred_r = np.array(y_pred_r_list)
 
-    f1 = f1_score(y_true_r, y_pred_r, average='macro') if len(
-        y_pred_r) > 0 else 0.0
+    f1 = f1_score(
+        y_true_r,
+        y_pred_r,
+        average='macro',
+        labels=list(range(num_classes)),
+        zero_division=0,
+    ) if len(y_pred_r) > 0 else 0.0
 
     return {
         'loss': avg_loss,
