@@ -619,6 +619,35 @@ class SiameseModel(nn.Module):
 # -------------------------------------------------------------------------
 
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss = -alpha * (1-pt)^gamma * log(pt)
+    支持 label_smoothing.
+    """
+
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        # inputs: [N, C]
+        # targets: [N]
+        ce_loss = nn.functional.cross_entropy(
+            inputs, targets, reduction='none', weight=self.alpha, label_smoothing=self.label_smoothing
+        )
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
 def mixup_data(x, y, alpha=1.0, device='cuda'):
     '''Returns mixed inputs, pairs of targets, and lambda'''
     if alpha > 0:
@@ -986,6 +1015,8 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
     parser.add_argument('--label_smoothing', type=float,
                         default=0.1, help='Label smoothing 系数')
+    parser.add_argument('--focal_gamma', type=float,
+                        default=2.0, help='Focal Loss gamma 参数')
     parser.add_argument('--warmup_epochs', type=int,
                         default=2, help='Warmup 轮数')
     parser.add_argument('--use_ema', action='store_true', help='启用 EMA')
@@ -1137,8 +1168,13 @@ def run_worker(rank, args):
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
     class_weights = compute_class_weights_from_df(
         train_df, args.num_classes).to(device)
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights, label_smoothing=args.label_smoothing)
+
+    # 替换为 Focal Loss
+    criterion = FocalLoss(
+        alpha=class_weights,
+        gamma=args.focal_gamma,
+        label_smoothing=args.label_smoothing
+    )
 
     scaler = torch.cuda.amp.GradScaler() if (
         not is_tpu and torch.cuda.is_available()) else None
