@@ -622,7 +622,7 @@ class SiameseModel(nn.Module):
 class FocalLoss(nn.Module):
     """
     Focal Loss = -alpha * (1-pt)^gamma * log(pt)
-    支持 label_smoothing.
+    修正版: 正确处理 class_weights 和 label_smoothing
     """
 
     def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.0):
@@ -633,19 +633,38 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets):
-        # inputs: [N, C]
-        # targets: [N]
+        # inputs: [N, C] (logits)
+        # targets: [N] (indices)
+
+        # 1. 计算 Cross Entropy Loss (不带任何权重，仅单纯计算 Loss 用于梯度回传)
+        # 这里为了配合 Focal Term，先不加 weight，手动应用
         ce_loss = nn.functional.cross_entropy(
-            inputs, targets, reduction='none', weight=self.alpha, label_smoothing=self.label_smoothing
+            inputs, targets, reduction='none', label_smoothing=self.label_smoothing
         )
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        # 2. 计算 pt (真实类别的预测概率) 用于 Focal Modulation
+        # pt 必须基于纯净的概率分布
+        p = torch.softmax(inputs, dim=1)
+        pt = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        # 3. 计算 Focal Term: (1 - pt) ^ gamma
+        focal_term = (1 - pt) ** self.gamma
+
+        # 4. 组合 Focal Loss
+        loss = focal_term * ce_loss
+
+        # 5. 手动应用类别权重 (alpha)
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            batch_weights = self.alpha.gather(0, targets)
+            loss = loss * batch_weights
 
         if self.reduction == 'mean':
-            return focal_loss.mean()
+            return loss.mean()
         elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
+            return loss.sum()
+        return loss
 
 
 def mixup_data(x, y, alpha=1.0, device='cuda'):
