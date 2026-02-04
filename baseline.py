@@ -18,7 +18,7 @@ from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from sklearn.metrics import accuracy_score, f1_score
 
 import timm
@@ -978,6 +978,10 @@ def parse_args():
                         help='Early Stopping patience')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
+    parser.add_argument('--sgkf_splits', type=int, default=5,
+                        help='StratifiedGroupKFold 折数')
+    parser.add_argument('--sgkf_fold', type=int, default=0,
+                        help='StratifiedGroupKFold 使用的折号 (0-based)')
     parser.add_argument('--mixup_alpha', type=float,
                         default=0, help='MixUp alpha 参数 (0表示禁用)')
     parser.add_argument('--grad_accum_steps', type=int, default=1,
@@ -1031,11 +1035,65 @@ def run_worker(rank, args):
             df['pid'] = df[col].astype(str).apply(lambda x: re.findall(
                 r'\d+', x)[0] if re.findall(r'\d+', x) else x)
 
-    pids = train_val_df['pid'].unique()
-    train_pids, val_pids = train_test_split(
-        pids, test_size=0.15, random_state=args.seed)
+    # 生成用于分层的标签（按pid聚合）
+    if 'stenosis_class' in train_val_df.columns and train_val_df['stenosis_class'].notna().any():
+        train_val_df['__label__'] = train_val_df['stenosis_class'].fillna(
+            -1).astype(int)
+    else:
+        train_val_df['__label__'] = train_val_df.get('stenosis_percentage', 0).fillna(0).apply(
+            lambda x: pct_to_class_6(float(x))
+        ).astype(int)
+
+    pid_labels = train_val_df.groupby('pid')['__label__'].agg(
+        lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0]
+    )
+    pid_list = pid_labels.index.to_numpy()
+    pid_y = pid_labels.to_numpy()
+
+    try:
+        n_splits = max(2, int(args.sgkf_splits))
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=args.seed)
+        splits = list(splitter.split(pid_list, pid_y, groups=pid_list))
+        fold = int(args.sgkf_fold)
+        if fold < 0 or fold >= n_splits:
+            if is_master:
+                print(f"sgkf_fold={fold} 超出范围，已回退为 0")
+            fold = 0
+        train_idx, val_idx = splits[fold]
+        train_pids, val_pids = pid_list[train_idx], pid_list[val_idx]
+        if is_master:
+            print(f"已启用 StratifiedGroupKFold (splits={n_splits}, fold={fold})")
+    except ValueError as exc:
+        if is_master:
+            print(f"StratifiedGroupKFold 失败，回退为普通随机划分: {exc}")
+        pids = train_val_df['pid'].unique()
+        train_pids, val_pids = train_test_split(
+            pids, test_size=0.15, random_state=args.seed)
     train_df = train_val_df[train_val_df['pid'].isin(train_pids)].copy()
     val_df = train_val_df[train_val_df['pid'].isin(val_pids)].copy()
+
+    if is_master and '__label__' in train_df.columns and '__label__' in val_df.columns:
+        def _count_and_ratio(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+            counts = df['__label__'].value_counts().reindex(
+                range(args.num_classes), fill_value=0).to_numpy()
+            total = counts.sum()
+            ratios = counts / \
+                total if total > 0 else np.zeros_like(counts, dtype=float)
+            return counts, ratios
+
+        tr_counts, tr_ratios = _count_and_ratio(train_df)
+        va_counts, va_ratios = _count_and_ratio(val_df)
+        print("每折类别分布统计 (按pid聚合标签):")
+        print(f"  Train counts: {tr_counts.tolist()}")
+        print(f"  Train ratios: {[round(r, 4) for r in tr_ratios.tolist()]}")
+        print(f"  Val counts  : {va_counts.tolist()}")
+        print(f"  Val ratios  : {[round(r, 4) for r in va_ratios.tolist()]}")
+
+    if '__label__' in train_df.columns:
+        train_df.drop(columns=['__label__'], inplace=True, errors='ignore')
+    if '__label__' in val_df.columns:
+        val_df.drop(columns=['__label__'], inplace=True, errors='ignore')
 
     test_root = args.test_img_root if os.path.exists(
         args.test_img_root) else args.img_root
