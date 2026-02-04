@@ -353,19 +353,12 @@ class DabangDataset(Dataset):
             T.Normalize(mean=[0.5], std=[0.5])
         ])
 
-        # 训练集数据增强: 针对 CPR 灰度图的温和几何与强度扰动
-        # 注意：避免过强形变，保持血管结构一致性
+        # 训练集数据增强: 保守方案（仅轻度几何扰动）
+        # 过强的强度/纹理扰动会破坏狭窄形态，易导致性能下降
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=10),
-                T.RandomAffine(degrees=0, translate=(
-                    0.05, 0.05), scale=(0.9, 1.1)),
-                T.RandomApply(
-                    [T.ColorJitter(brightness=0.15, contrast=0.15)], p=0.5),
-                T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
-                T.RandomApply(
-                    [T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
+                T.RandomRotation(degrees=5),
             ])
         else:
             self.aug_transform = None
