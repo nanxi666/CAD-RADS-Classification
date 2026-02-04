@@ -23,6 +23,8 @@ from sklearn.metrics import accuracy_score, f1_score
 
 import timm
 import warnings
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 # 忽略所有警告
 warnings.filterwarnings("ignore")
 
@@ -348,23 +350,42 @@ class DabangDataset(Dataset):
             'RCA': 3,
         }
 
-        # 基础图像预处理: 调整大小 -> 转张量 -> 归一化
-        # 假设输入为灰度图 (单通道)，使用 mean=0.5, std=0.5 进行各种归一化
-        self.transform = T.Compose([
-            T.Resize((img_size, img_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5], std=[0.5])
-        ])
+        # 基础数据增强与预处理 (Albumentations)
+        # 注意: Albumentations 处理的是 numpy array (H, W, C)
 
-        # 训练集数据增强: 保守方案（仅轻度几何扰动）
-        # 过强的强度/纹理扰动会破坏狭窄形态，易导致性能下降
+        # 训练集增强策略
         if augment:
-            self.aug_transform = T.Compose([
-                T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=5),
+            self.transform = A.Compose([
+                A.Resize(height=img_size, width=img_size),
+                # 几何变换
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=15, p=0.5),
+                A.ShiftScaleRotate(shift_limit=0.0625,
+                                   scale_limit=0.1, rotate_limit=15, p=0.5),
+
+                # 像素级变换 (适度使用，避免破坏血管细节)
+                A.RandomBrightnessContrast(p=0.2),
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=3, p=0.2),
+                    A.MotionBlur(blur_limit=3, p=0.2),
+                ], p=0.3),
+
+                # 模拟遮挡/噪声
+                A.CoarseDropout(max_holes=8, max_height=img_size //
+                                10, max_width=img_size//10, p=0.2),
+
+                # 归一化与转换为 Tensor
+                A.Normalize(mean=(0.5,), std=(0.5,)),
+                ToTensorV2(),
             ])
         else:
-            self.aug_transform = None
+            # 验证/测试集: 仅调整大小和归一化
+            self.transform = A.Compose([
+                A.Resize(height=img_size, width=img_size),
+                A.Normalize(mean=(0.5,), std=(0.5,)),
+                ToTensorV2(),
+            ])
 
         # 预先加载数据索引
         self.samples = self._load_index(df)
@@ -422,14 +443,18 @@ class DabangDataset(Dataset):
 
         for p in paths:
             try:
-                # 读取图像并转为单通道灰度图 ('L')
-                img = Image.open(p).convert('L')
+                # 读取图像并转为 Numpy 数组
+                # Albumentations 需要 numpy array 输入
+                # 保持单通道模式 ('L') -> numpy shape (H, W) or (H, W, 1) after conversion ?
+                # Image.open(...).convert('L') 得到 (H, W)
+                img_pil = Image.open(p).convert('L')
+                img_np = np.array(img_pil)  # shape (H, W)
 
-                # 应用增强
-                if self.aug_transform:
-                    img = self.aug_transform(img)
+                # 应用 Albumentations
+                # transform(image=...) 返回字典
+                augmented = self.transform(image=img_np)
+                t = augmented['image']  # 此时 t 已经是 Tensor [C, H, W]
 
-                t = self.transform(img)
                 tensors.append(t)
             except Exception:
                 # 异常容错: 返回全零张量
