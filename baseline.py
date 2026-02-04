@@ -181,7 +181,6 @@ def replace_batchnorm_with_groupnorm(model: nn.Module, num_groups: int = 16, is_
     return model
 
 
-
 def pct_to_class_6(pct: float) -> int:
     """
     将狭窄百分比转换为竞赛规定的 6 分类标签。
@@ -1104,8 +1103,6 @@ def run_worker(rank, args):
 
     model.to(device)
 
-
-
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
     class_weights = compute_class_weights_from_df(
@@ -1158,12 +1155,12 @@ def run_worker(rank, args):
         optimizer.zero_grad()
         for _ in range(args.warmup_steps):
             try:
-                x, y, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _ = next(warmup_iter)
             except StopIteration:
                 warmup_iter = iter(loader_wrapper)
-                x, y, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _ = next(warmup_iter)
             x, y = x.to(device), y.to(device)
-            outputs = model(x)
+            outputs = model(x, vessel_idx)
             loss = criterion(outputs, y)
             loss.backward()
             if TPU_AVAILABLE and device.type == 'xla':
