@@ -906,6 +906,8 @@ def parse_args():
                         default=0, help='MixUp alpha 参数 (0表示禁用)')
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='梯度累积步数 (用于降低显存占用)')
+    parser.add_argument('--warmup_steps', type=int, default=1,
+                        help='训练前 warmup 步数（用于摊薄 TPU 首轮编译成本）')
 
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
@@ -1052,6 +1054,34 @@ def run_worker(rank, args):
 
     if is_master:
         print("开始训练流程...")
+
+    # TPU warmup：运行少量 step 触发编译（不计入统计）
+    if args.warmup_steps > 0:
+        if is_master:
+            print(f"Warmup {args.warmup_steps} step(s)...")
+        model.train()
+        loader_wrapper = train_loader
+        if TPU_AVAILABLE and device.type == 'xla':
+            loader_wrapper = pl.ParallelLoader(
+                train_loader, [device]).per_device_loader(device)
+        warmup_iter = iter(loader_wrapper)
+        optimizer.zero_grad()
+        for _ in range(args.warmup_steps):
+            try:
+                x, y, _, _ = next(warmup_iter)
+            except StopIteration:
+                warmup_iter = iter(loader_wrapper)
+                x, y, _, _ = next(warmup_iter)
+            x, y = x.to(device), y.to(device)
+            outputs = model(x)
+            loss = criterion(outputs, y)
+            loss.backward()
+            if TPU_AVAILABLE and device.type == 'xla':
+                xm.optimizer_step(optimizer, barrier=True)
+                xm.mark_step()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
     for epoch in range(args.epochs):
         t0 = time.time()
