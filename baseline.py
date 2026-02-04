@@ -13,6 +13,8 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
@@ -236,6 +238,21 @@ def compute_class_weights_from_df(df: pd.DataFrame, num_classes: int) -> torch.T
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def build_warmup_cosine_scheduler(optimizer, total_epochs: int, warmup_epochs: int):
+    """线性 warmup + 余弦退火调度器（epoch 级）。"""
+    warmup_epochs = max(0, min(warmup_epochs, total_epochs))
+    if warmup_epochs == 0:
+        return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+
+    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_epochs - warmup_epochs),
+        eta_min=1e-6,
+    )
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+
+
 class EarlyStopping:
     """早停机制（基于验证集宏F1，越大越好）"""
 
@@ -358,11 +375,11 @@ class DabangDataset(Dataset):
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=10),
+                T.RandomRotation(degrees=5),
                 T.RandomAffine(degrees=0, translate=(
                     0.05, 0.05), scale=(0.9, 1.1)),
                 T.RandomApply(
-                    [T.ColorJitter(brightness=0.15, contrast=0.15)], p=0.5),
+                    [T.ColorJitter(brightness=0.1, contrast=0.1)], p=0.5),
                 T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
                 T.RandomApply(
                     [T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
@@ -596,7 +613,8 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0, grad_accum_steps: int = 1):
+def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0,
+                grad_accum_steps: int = 1, ema_model=None, swa_model=None, swa_start: int = 0, epoch: int = 0):
     """单轮训练逻辑，支持 MixUp"""
     model.train()
     if TPU_AVAILABLE and device.type == 'xla':
@@ -622,6 +640,12 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         iter_loader = loader_wrapper
         pbar = None
 
+    def _update_ema_swa():
+        if ema_model is not None:
+            ema_model.update_parameters(model)
+        if (swa_model is not None) and (epoch >= swa_start):
+            swa_model.update_parameters(model)
+
     for step, (x, y, _, _) in enumerate(iter_loader):
         x, y = x.to(device), y.to(device)
 
@@ -641,6 +665,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             if (step + 1) % grad_accum_steps == 0:
                 xm.optimizer_step(optimizer, barrier=True)
                 xm.mark_step()
+                _update_ema_swa()
                 optimizer.zero_grad()
         else:
             if use_mixup:
@@ -660,6 +685,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                 if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
+                    _update_ema_swa()
                     optimizer.zero_grad()
             else:
                 outputs = model(x)
@@ -670,6 +696,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     optimizer.step()
+                    _update_ema_swa()
                     optimizer.zero_grad()
 
         # 统计指标
@@ -697,6 +724,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
     if TPU_AVAILABLE and (len(loader) % grad_accum_steps != 0):
         xm.optimizer_step(optimizer, barrier=True)
         xm.mark_step()
+        _update_ema_swa()
         optimizer.zero_grad()
     elif (not TPU_AVAILABLE) and (len(loader) % grad_accum_steps != 0):
         if scaler is not None:
@@ -704,6 +732,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             scaler.update()
         else:
             optimizer.step()
+        _update_ema_swa()
         optimizer.zero_grad()
 
     if TPU_AVAILABLE:
@@ -921,6 +950,16 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=256, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
+    parser.add_argument('--label_smoothing', type=float,
+                        default=0.1, help='Label smoothing 系数')
+    parser.add_argument('--warmup_epochs', type=int,
+                        default=2, help='Warmup 轮数')
+    parser.add_argument('--use_ema', action='store_true', help='启用 EMA')
+    parser.add_argument('--ema_decay', type=float,
+                        default=0.999, help='EMA 衰减率')
+    parser.add_argument('--use_swa', action='store_true', help='启用 SWA')
+    parser.add_argument('--swa_start', type=int, default=10, help='SWA 开始轮次')
+    parser.add_argument('--swa_lr', type=float, default=1e-5, help='SWA 学习率')
     parser.add_argument('--tpu_lr_scale', type=float, default=0.25,
                         help='TPU 学习率缩放因子 (默认1.0, 避免自动线性放大)')
     parser.add_argument('--tpu_batch_is_global', action='store_true',
@@ -1064,13 +1103,27 @@ def run_worker(rank, args):
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
     class_weights = compute_class_weights_from_df(
         train_df, args.num_classes).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights, label_smoothing=args.label_smoothing)
 
     scaler = torch.cuda.amp.GradScaler() if (
         not is_tpu and torch.cuda.is_available()) else None
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs)
+
+    ema_model = None
+    if args.use_ema:
+        def _ema_avg_fn(averaged_param, param, num_averaged):
+            return averaged_param * args.ema_decay + param * (1.0 - args.ema_decay)
+
+        ema_model = AveragedModel(model, avg_fn=_ema_avg_fn).to(device)
+
+    swa_model = None
+    swa_scheduler = None
+    if args.use_swa:
+        swa_model = AveragedModel(model).to(device)
+        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
 
     def master_print(*args_p, **kwargs_p):
         if is_master:
@@ -1121,12 +1174,17 @@ def run_worker(rank, args):
 
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, scaler,
-            mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps)
+            mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
+            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
 
-        scheduler.step()
+        if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
+            swa_scheduler.step()
+        else:
+            scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        val_metrics = validate(model, val_loader, device,
+        eval_model = ema_model if (ema_model is not None) else model
+        val_metrics = validate(eval_model, val_loader, device,
                                criterion, num_classes=args.num_classes)
 
         dt = time.time() - t0
@@ -1141,12 +1199,12 @@ def run_worker(rank, args):
                 save_path = os.path.join(args.output_dir, "best_model.pt")
                 if is_tpu:
                     cpu_state_dict = {k: v.cpu()
-                                      for k, v in model.state_dict().items()}
+                                      for k, v in eval_model.state_dict().items()}
                     torch.save(cpu_state_dict, save_path)
                     del cpu_state_dict
                 else:
-                    state_dict = model.module.state_dict() if isinstance(
-                        model, nn.DataParallel) else model.state_dict()
+                    state_dict = eval_model.module.state_dict() if isinstance(
+                        eval_model, nn.DataParallel) else eval_model.state_dict()
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Acc] 性能提升，模型已保存至: {save_path}")
 
@@ -1155,16 +1213,16 @@ def run_worker(rank, args):
                 save_path = os.path.join(args.output_dir, "best_model_loss.pt")
                 if is_tpu:
                     cpu_state_dict = {k: v.cpu()
-                                      for k, v in model.state_dict().items()}
+                                      for k, v in eval_model.state_dict().items()}
                     torch.save(cpu_state_dict, save_path)
                     del cpu_state_dict
                 else:
-                    state_dict = model.module.state_dict() if isinstance(
-                        model, nn.DataParallel) else model.state_dict()
+                    state_dict = eval_model.module.state_dict() if isinstance(
+                        eval_model, nn.DataParallel) else eval_model.state_dict()
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Loss] 性能提升，模型已保存至: {save_path}")
 
-        early_stopping(val_metrics['f1'], model)
+        early_stopping(val_metrics['f1'], eval_model)
 
         stop_flag = False
         if early_stopping.early_stop:
@@ -1180,6 +1238,22 @@ def run_worker(rank, args):
             if is_master:
                 print("Early stopping triggered!")
             break
+
+    if args.use_swa and (swa_model is not None):
+        if is_master:
+            print("\n开始更新 SWA BN 统计...")
+        if not is_tpu:
+            update_bn(train_loader, swa_model, device=device)
+        else:
+            if is_master:
+                print("TPU 环境下跳过 SWA 的 BN 更新")
+
+        if is_master:
+            swa_path = os.path.join(args.output_dir, "swa_model.pt")
+            state_dict = swa_model.module.state_dict() if isinstance(
+                swa_model, nn.DataParallel) else swa_model.state_dict()
+            torch.save(state_dict, swa_path)
+            print(f"SWA 模型已保存至: {swa_path}")
 
     if test_loader:
         if is_master:
