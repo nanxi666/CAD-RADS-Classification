@@ -358,7 +358,15 @@ class DabangDataset(Dataset):
         if augment:
             self.aug_transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=5),
+                T.RandomRotation(degrees=10),
+                T.RandomAffine(degrees=0, translate=(
+                    0.05, 0.05), scale=(0.9, 1.1)),
+                T.RandomApply(
+                    [T.ColorJitter(brightness=0.15, contrast=0.15)], p=0.5),
+                T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
+                T.RandomApply(
+                    [T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
+
             ])
         else:
             self.aug_transform = None
