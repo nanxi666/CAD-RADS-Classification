@@ -498,7 +498,7 @@ class SiameseModel(nn.Module):
                 d_model=feature_dim,
                 nhead=nhead,
                 dim_feedforward=feature_dim * 4,
-                dropout=0.5,
+                dropout=0.4,
                 batch_first=True,
                 activation="gelu",
             ),
@@ -882,7 +882,7 @@ def parse_args():
     parser.add_argument('--output_dir', default="./results", help="结果输出目录")
 
     # 模型参数
-    parser.add_argument('--model', default='convnext_small',
+    parser.add_argument('--model', default='convnext_tiny',
                         help='模型架构名称 (支持 timm)')
     parser.add_argument('--num_classes', type=int, default=6, help='分类类别数')
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
