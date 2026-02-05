@@ -375,15 +375,17 @@ class DabangDataset(Dataset):
                 A.CoarseDropout(max_holes=8, max_height=img_size //
                                 10, max_width=img_size//10, p=0.2),
 
-                # 归一化与转换为 Tensor
-                A.Normalize(mean=(0.5,), std=(0.5,)),
+                # 归一化 (使用 ImageNet 统计数据)
+                A.Normalize(mean=(0.485, 0.456, 0.406),
+                            std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
             ])
         else:
             # 验证/测试集: 仅调整大小和归一化
             self.transform = A.Compose([
                 A.Resize(height=img_size, width=img_size),
-                A.Normalize(mean=(0.5,), std=(0.5,)),
+                A.Normalize(mean=(0.485, 0.456, 0.406),
+                            std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
             ])
 
@@ -443,27 +445,21 @@ class DabangDataset(Dataset):
 
         for p in paths:
             try:
-                # 读取图像并转为 Numpy 数组
-                # Albumentations 需要 numpy array 输入
-                # 保持单通道模式 ('L') -> numpy shape (H, W) or (H, W, 1) after conversion ?
-                # Image.open(...).convert('L') 得到 (H, W)
-                img_pil = Image.open(p).convert('L')
-                img_np = np.array(img_pil)  # shape (H, W)
+                # 读取图像并转为 Numpy 数组，强制转换为 RGB
+                img_pil = Image.open(p).convert('RGB')
+                img_np = np.array(img_pil)  # shape (H, W, 3)
 
                 # 应用 Albumentations
-                # transform(image=...) 返回字典
                 augmented = self.transform(image=img_np)
-                t = augmented['image']  # 此时 t 已经是 Tensor [C, H, W]
+                t = augmented['image']  # Tensor [3, H, W]
 
                 tensors.append(t)
             except Exception:
                 # 异常容错: 返回全零张量
-                tensors.append(torch.zeros((1, 224, 224)))
+                tensors.append(torch.zeros((3, 224, 224)))
 
-        # 核心逻辑: 将多视图在通道维度堆叠
-        # 输入: List of [1, H, W] -> Output: [num_views, H, W]
-        # 注意: 这里假设是单通道图片。如果是RGB，通道数需 x3
-        x = torch.cat(tensors, dim=0)
+        # 堆叠视图 -> [Num_Views, 3, H, W]
+        x = torch.stack(tensors, dim=0)
         return x, label, vessel_idx, rid, pid
 
 # -------------------------------------------------------------------------
@@ -513,14 +509,12 @@ class SiameseModel(nn.Module):
         self.vessel_emb_dim = vessel_emb_dim
 
         # 1. 创建共享的 Backbone (Siamese Network)
-        # in_chans=1: 因为输入是单通道灰度图
-        # num_classes=0: 只提取特征向量，不进行分类
-        # pretrained=True: 使用 ImageNet 预训练权重加速收敛
+        # in_chans=3: RGB 输入
         self.backbone = timm.create_model(
             model_name,
             pretrained=True,
             num_classes=0,
-            in_chans=1,
+            in_chans=3,
             drop_path_rate=0
         )
 
@@ -574,12 +568,11 @@ class SiameseModel(nn.Module):
         )
 
     def forward(self, x, vessel_idx=None):
-        # x shape: [Batch, Views, H, W] -> [B, 8, 224, 224]
-        b, v, h, w = x.shape
+        # x shape: [Batch, Views, 3, H, W]
+        b, v, c, h, w = x.shape
 
-        # 1. Reshape 为 [Batch * Views, 1, H, W] 以输入 Backbone
-        # 添加 channel 维度 (unsqueeze(1) 没法直接用，因为 x 是 [B, V, H, W]，要变成 [B*V, 1, H, W])
-        x = x.view(b * v, 1, h, w)
+        # 1. Reshape 为 [Batch * Views, C, H, W] 以输入 Backbone
+        x = x.view(b * v, c, h, w)
 
         # 2. 提取特征 -> [Batch * Views, Feature_Dim]
         features = self.backbone(x)
