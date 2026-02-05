@@ -109,9 +109,6 @@ if _is_tpu_env():
         import torch_xla.distributed.xla_multiprocessing as xmp
         import torch_xla.runtime as xr
 
-        # 增加 TPU 编译缓存配置，减少重复编译导致的抖动
-        os.environ['XRU_CACHE_COMPILATION'] = '1'
-
         TPU_AVAILABLE = True
         _try_enable_transparent_hugepages()
     except ImportError:
