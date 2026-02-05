@@ -237,42 +237,48 @@ def build_warmup_cosine_scheduler(optimizer, total_epochs: int, warmup_epochs: i
 
 
 class EarlyStopping:
-    """早停机制（基于验证集宏F1，越大越好）"""
+    """早停机制（通用版）"""
 
-    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print, mode='max'):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.best_metric = -np.inf
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
+        self.mode = mode
 
-    def __call__(self, val_f1, model):
-        score = val_f1
+    def __call__(self, val_score, model):
+        score = val_score
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_f1, model)
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.verbose:
-                self.trace_func(
-                    f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
+            self.save_checkpoint(val_score, model)
         else:
-            self.best_score = score
-            self.save_checkpoint(val_f1, model)
-            self.counter = 0
+            if self.mode == 'max':
+                improved = score > self.best_score + self.delta
+            else:
+                improved = score < self.best_score - self.delta
 
-    def save_checkpoint(self, val_f1, model):
-        '''验证集宏F1提升时保存模型'''
+            if improved:
+                self.best_score = score
+                self.save_checkpoint(val_score, model)
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.verbose:
+                    self.trace_func(
+                        f'EarlyStopping counter: {self.counter} out of {self.patience}')
+                if self.counter >= self.patience:
+                    self.early_stop = True
+
+    def save_checkpoint(self, val_score, model):
+        '''验证集指标提升时保存模型'''
         if self.verbose:
             self.trace_func(
-                f'Validation F1 increased ({self.best_metric:.6f} --> {val_f1:.6f}).  Saving model ...')
+                f'Validation metric improved. Current: {val_score:.6f}. Saving model ...')
         if TPU_AVAILABLE:
             if xr.global_ordinal() == 0:
                 cpu_state_dict = {k: v.cpu()
@@ -283,7 +289,6 @@ class EarlyStopping:
             start_state_dict = model.module.state_dict() if isinstance(
                 model, nn.DataParallel) else model.state_dict()
             torch.save(start_state_dict, self.path)
-        self.best_metric = val_f1
 
 
 def find_multiview_images(image_root: str, record_id: str, cache: Dict[str, List[str]] = {}) -> List[str]:
@@ -1041,7 +1046,9 @@ def parse_args():
     parser.add_argument('--focal_gamma', type=float,
                         default=2.0, help='Focal Loss gamma 参数')
     parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'focal'],
-                        help='损失函数类型: "ce" (CrossEntropy, 推荐 Accuracy) 或 "focal" (推荐 F1)')
+                        help='损失函数类型: "ce" (CrossEntropy) 或 "focal" (F1优化)')
+    parser.add_argument('--monitor_metric', type=str, default='acc', choices=['acc', 'f1', 'loss'],
+                        help='早停监控指标: "acc", "f1" 或 "loss"')
     parser.add_argument('--use_class_weights', action='store_true',
                         help='是否使用类别权重 (Accuracy 优化建议关闭)')
     parser.add_argument('--warmup_epochs', type=int,
@@ -1244,14 +1251,27 @@ def run_worker(rank, args):
         if is_master:
             print(*args_p, **kwargs_p)
 
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True, path=os.path.join(
-        args.output_dir, "best_model_f1.pt"), trace_func=master_print)
+    # 确定监控指标和模式
+    metric_map = {
+        'acc': ('max', 'best_model.pt'),
+        'f1': ('max', 'best_model_f1.pt'),
+        'loss': ('min', 'best_model_loss.pt')
+    }
+    monitor_mode, monitor_path = metric_map[args.monitor_metric]
+
+    early_stopping = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, monitor_path),
+        trace_func=master_print,
+        mode=monitor_mode
+    )
 
     best_acc = 0.0
     best_loss = float('inf')
 
     if is_master:
-        print("开始训练流程...")
+        print(f"开始训练流程... (早停监控: {args.monitor_metric}, mode={monitor_mode})")
 
     # TPU warmup：运行少量 step 触发编译（不计入统计）
     if args.warmup_steps > 0:
@@ -1337,7 +1357,9 @@ def run_worker(rank, args):
                     torch.save(state_dict, save_path)
                 print(f"  >>> [Loss] 性能提升，模型已保存至: {save_path}")
 
-        early_stopping(val_metrics['f1'], eval_model)
+        # 早停检查
+        current_score = val_metrics[args.monitor_metric]
+        early_stopping(current_score, eval_model)
 
         stop_flag = False
         if early_stopping.early_stop:
