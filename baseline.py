@@ -19,7 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 import timm
 import warnings
@@ -891,6 +891,17 @@ def validate(model, loader, device, criterion, num_classes=6):
         zero_division=0,
     ) if len(y_pred_r) > 0 else 0.0
 
+    # 打印详细分类报告 (仅在主进程)
+    if show_pbar:
+        print("\nClassification Report:")
+        print(classification_report(
+            y_true_r,
+            y_pred_r,
+            labels=list(range(num_classes)),
+            zero_division=0,
+            digits=4
+        ))
+
     return {
         'loss': avg_loss,
         'acc': avg_acc,
@@ -1029,6 +1040,10 @@ def parse_args():
                         default=0.1, help='Label smoothing 系数')
     parser.add_argument('--focal_gamma', type=float,
                         default=2.0, help='Focal Loss gamma 参数')
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'focal'],
+                        help='损失函数类型: "ce" (CrossEntropy, 推荐 Accuracy) 或 "focal" (推荐 F1)')
+    parser.add_argument('--use_class_weights', action='store_true',
+                        help='是否使用类别权重 (Accuracy 优化建议关闭)')
     parser.add_argument('--warmup_epochs', type=int,
                         default=2, help='Warmup 轮数')
     parser.add_argument('--use_ema', action='store_true', help='启用 EMA')
@@ -1178,15 +1193,33 @@ def run_worker(rank, args):
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
     optimizer = optim.Adam(model.parameters(), lr=effective_lr)
-    class_weights = compute_class_weights_from_df(
-        train_df, args.num_classes).to(device)
 
-    # 替换为 Focal Loss
-    criterion = FocalLoss(
-        alpha=class_weights,
-        gamma=args.focal_gamma,
-        label_smoothing=args.label_smoothing
-    )
+    if args.use_class_weights:
+        class_weights = compute_class_weights_from_df(
+            train_df, args.num_classes).to(device)
+        if is_master:
+            print(f"已启用类别权重: {class_weights.tolist()}")
+    else:
+        class_weights = None
+        if is_master:
+            print("未启用类别权重 (优化 Accuracy)")
+
+    # 选择损失函数
+    if args.loss_type == 'focal':
+        criterion = FocalLoss(
+            alpha=class_weights,
+            gamma=args.focal_gamma,
+            label_smoothing=args.label_smoothing
+        )
+        if is_master:
+            print(f"使用 FocalLoss (gamma={args.focal_gamma})")
+    else:
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+        if is_master:
+            print("使用 CrossEntropyLoss")
 
     scaler = torch.cuda.amp.GradScaler() if (
         not is_tpu and torch.cuda.is_available()) else None
