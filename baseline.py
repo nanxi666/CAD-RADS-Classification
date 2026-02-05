@@ -111,7 +111,7 @@ if _is_tpu_env():
 
         # 增加 TPU 编译缓存配置，减少重复编译导致的抖动
         os.environ['XRU_CACHE_COMPILATION'] = '1'
-        os.environ['XLA_USE_BF16'] = '1' # 推荐在 v5e 上开启 BF16
+        os.environ['XLA_USE_BF16'] = '1'  # 推荐在 v5e 上开启 BF16
 
         TPU_AVAILABLE = True
         _try_enable_transparent_hugepages()
@@ -901,7 +901,6 @@ def validate(model, loader, device, criterion, num_classes=6):
         zero_division=0,
     ) if len(y_pred_r) > 0 else 0.0
 
-
     return {
         'loss': avg_loss,
         'acc': avg_acc,
@@ -1246,32 +1245,45 @@ def run_worker(rank, args):
         if is_master:
             print(*args_p, **kwargs_p)
 
-    # 确定监控指标和模式
-    metric_map = {
-        'acc': ('max', 'best_model.pt'),
-        'f1': ('max', 'best_model_f1.pt'),
-        'loss': ('min', 'best_model_loss.pt')
-    }
-    monitor_mode, monitor_path = metric_map[args.monitor_metric]
+    # ---------------------------------------------------------------------
+    # 策略修改: 同时监控 Acc, F1, Loss 三个指标
+    # 只有当三个指标都耗尽耐心(Patience)时，才触发早停。
+    # 这样可以确保模型在任何一个维度仍有进步空间时继续训练。
+    # ---------------------------------------------------------------------
 
-    early_stopping = EarlyStopping(
+    # 1. Accuracy Monitor (Max)
+    es_acc = EarlyStopping(
         patience=args.patience,
         verbose=True,
-        path=os.path.join(args.output_dir, monitor_path),
-        trace_func=master_print,
-        mode=monitor_mode
+        path=os.path.join(args.output_dir, 'best_model.pt'),
+        trace_func=lambda s: master_print(f"[ES-Acc] {s}"),
+        mode='max'
+    )
+
+    # 2. F1 Monitor (Max)
+    es_f1_monitor = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'best_model_f1.pt'),
+        trace_func=lambda s: master_print(f"[ES-F1] {s}"),
+        mode='max'
+    )
+
+    # 3. Loss Monitor (Min)
+    es_loss_monitor = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'best_model_loss.pt'),
+        trace_func=lambda s: master_print(f"[ES-Loss] {s}"),
+        mode='min'
     )
 
     best_acc = 0.0
     best_loss = float('inf')
 
     if is_master:
-        print(f"开始训练流程... (早停监控: {args.monitor_metric}, mode={monitor_mode})")
-
-    # TPU warmup：运行少量 step 触发编译（不计入统计）
-    if args.warmup_steps > 0:
-        if is_master:
-            print(f"Warmup {args.warmup_steps} step(s)...")
+        print(f"开始训练流程... (联合早停策略: 等待 Acc/F1/Loss 全部停止改善)")
+        print(f"Warmup {args.warmup_steps} step(s)...")
         model.train()
         loader_wrapper = train_loader
         if TPU_AVAILABLE and device.type == 'xla':
@@ -1326,38 +1338,23 @@ def run_worker(rank, args):
 
             if val_metrics['acc'] > best_acc:
                 best_acc = val_metrics['acc']
-                save_path = os.path.join(args.output_dir, "best_model.pt")
-                if is_tpu:
-                    cpu_state_dict = {k: v.cpu()
-                                      for k, v in eval_model.state_dict().items()}
-                    torch.save(cpu_state_dict, save_path)
-                    del cpu_state_dict
-                else:
-                    state_dict = eval_model.module.state_dict() if isinstance(
-                        eval_model, nn.DataParallel) else eval_model.state_dict()
-                    torch.save(state_dict, save_path)
-                print(f"  >>> [Acc] 性能提升，模型已保存至: {save_path}")
+                # 注: 具体的保存逻辑已移交给 es_acc_monitor，此处仅做记录或日志打印
+                # (之前的 print 和 save 逻辑已由 EarlyStopping 接管)
+                if is_master:
+                    print(f"  >>> [Acc] new high: {best_acc:.4f}")
 
             if val_metrics['loss'] < best_loss:
                 best_loss = val_metrics['loss']
-                save_path = os.path.join(args.output_dir, "best_model_loss.pt")
-                if is_tpu:
-                    cpu_state_dict = {k: v.cpu()
-                                      for k, v in eval_model.state_dict().items()}
-                    torch.save(cpu_state_dict, save_path)
-                    del cpu_state_dict
-                else:
-                    state_dict = eval_model.module.state_dict() if isinstance(
-                        eval_model, nn.DataParallel) else eval_model.state_dict()
-                    torch.save(state_dict, save_path)
-                print(f"  >>> [Loss] 性能提升，模型已保存至: {save_path}")
+                # 注: 具体的保存逻辑已移交给 es_loss_monitor
 
-        # 早停检查
-        current_score = val_metrics[args.monitor_metric]
-        early_stopping(current_score, eval_model)
+        # 更新三个早停监控器
+        es_acc(val_metrics['acc'], eval_model)
+        es_f1_monitor(val_metrics['f1'], eval_model)
+        es_loss_monitor(val_metrics['loss'], eval_model)
 
+        # 联合早停检查：只有当三个都触发 Early Stop 时才真正停止
         stop_flag = False
-        if early_stopping.early_stop:
+        if es_acc.early_stop and es_f1_monitor.early_stop and es_loss_monitor.early_stop:
             stop_flag = True
 
         if is_tpu:
