@@ -111,7 +111,6 @@ if _is_tpu_env():
 
         # 增加 TPU 编译缓存配置，减少重复编译导致的抖动
         os.environ['XRU_CACHE_COMPILATION'] = '1'
-        os.environ['XLA_USE_BF16'] = '1'  # 推荐在 v5e 上开启 BF16
 
         TPU_AVAILABLE = True
         _try_enable_transparent_hugepages()
