@@ -1148,6 +1148,10 @@ def run_worker(rank, args):
         test_ds = None
 
     loader_num_workers = 0 if is_tpu else args.num_workers
+    if (not is_tpu) and os.name == "nt" and loader_num_workers > 0:
+        if is_master:
+            print("检测到 Windows 环境，num_workers>0 可能导致 DataLoader 卡住，已自动设为 0")
+        loader_num_workers = 0
     if is_tpu and args.tpu_batch_is_global:
         per_core_batch = max(1, args.batch_size // xr.world_size())
     else:
@@ -1162,6 +1166,8 @@ def run_worker(rank, args):
         'pin_memory': not is_tpu,
         'drop_last': False  # 用户要求保留所有数据
     }
+    if loader_num_workers > 0:
+        loader_args['persistent_workers'] = False
 
     if is_tpu:
         # 用户数据量少，不想丢弃数据，因此设为 False。
@@ -1302,6 +1308,7 @@ def run_worker(rank, args):
     if is_master:
         print(f"开始训练流程... (联合早停策略: 等待 Acc/F1/Loss 全部停止改善)")
         print(f"Warmup {args.warmup_steps} step(s)...")
+    if args.warmup_steps > 0:
         model.train()
         loader_wrapper = train_loader
         if TPU_AVAILABLE and device.type == 'xla':
@@ -1325,6 +1332,8 @@ def run_worker(rank, args):
             else:
                 optimizer.step()
             optimizer.zero_grad()
+        if TPU_AVAILABLE and device.type == 'xla':
+            xm.rendezvous("warmup_done")
 
     for epoch in range(args.epochs):
         t0 = time.time()
