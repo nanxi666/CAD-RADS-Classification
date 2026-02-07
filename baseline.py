@@ -1171,6 +1171,10 @@ def run_worker(rank, args):
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
 
+        train_loader = DataLoader(
+            train_ds, sampler=train_sampler, **loader_args)
+        val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
+
         if test_ds:
             test_sampler = torch.utils.data.distributed.DistributedSampler(
                 test_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
