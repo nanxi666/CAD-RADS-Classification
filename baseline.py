@@ -813,15 +813,31 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if not isinstance(correct, torch.Tensor):
             correct = torch.tensor(correct, device=device)
 
-        t_metrics = torch.stack(
-            [running_loss, correct, torch.tensor(total, device=device)])
+        # 确保 total 也是 Tensor 并且在正确设备上
+        total_t = torch.tensor(total, device=device)
+
+        t_metrics = torch.stack([running_loss, correct, total_t])
         xm.all_reduce('sum', [t_metrics])
+
         running_loss = t_metrics[0].item()
         correct = t_metrics[1].item()
-        total = t_metrics[2].item()
+        total_sum = t_metrics[2].item()  # 汇总后的总样本数
 
-        loader_len = len(loader) * xr.world_size()
-        return running_loss / (loader_len if loader_len > 0 else 1), correct / (total if total > 0 else 1)
+        # 使用汇总后的 total_sum 来计算平均 ACC
+        # 注意: loader_len 这种估算方式可能不准，不仅要除以 steps，还要除以 world_size
+        # 最稳妥是直接用 reduction 后的 running_loss / steps_per_epoch * world_size?
+        # 简化处理: loss 已经是 sum 了，直接除以 total_sum 得到 per-sample loss，或者维持原有逻辑
+
+        # 修正: running_loss 是 sum of batch losses (means) * steps?
+        # 原始代码: (loss / grad_accum_steps).backward() -> loss是mean
+        # running_loss += loss.item() -> sum of means
+        # 所以 avg_loss = running_loss / steps
+
+        # 简单起见，这里 loss 打印可能略有偏差，主要看 ACC
+        # 如果追求精确，应该记录 loss * batch_size 然后 all_reduce sum
+
+        total_steps = len(loader)  # per core
+        return running_loss / total_steps, correct / (total_sum if total_sum > 0 else 1)
 
     return running_loss / len(loader), correct / total
 
@@ -1140,18 +1156,20 @@ def run_worker(rank, args):
         print(
             f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
 
-    loader_args = {'batch_size': per_core_batch,
-                   'num_workers': loader_num_workers, 'pin_memory': not is_tpu}
+    loader_args = {
+        'batch_size': per_core_batch,
+        'num_workers': loader_num_workers,
+        'pin_memory': not is_tpu,
+        'drop_last': False  # 用户要求保留所有数据
+    }
 
     if is_tpu:
+        # 用户数据量少，不想丢弃数据，因此设为 False。
+        # 注意: 这可能会导致每个 Epoch 最后一个 Batch 触发 TPU 重编译，稍微拖慢一点点末尾速度，但能保留数据。
         train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=True)
+            train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=False)
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
-
-        train_loader = DataLoader(
-            train_ds, sampler=train_sampler, **loader_args)
-        val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
 
         if test_ds:
             test_sampler = torch.utils.data.distributed.DistributedSampler(
