@@ -363,7 +363,7 @@ class DabangDataset(Dataset):
         # 训练集增强策略
         if augment:
             self.transform = A.Compose([
-                A.RandomResizedCrop(height=img_size, width=img_size,
+                A.RandomResizedCrop(size=(img_size, img_size),
                                     scale=(0.9, 1.0), ratio=(0.95, 1.05), p=1.0),
                 # 几何变换
                 A.HorizontalFlip(p=0.5),
