@@ -968,7 +968,25 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
     if (not TPU_AVAILABLE) or (xr.global_ordinal() == 0):
         print(f"\n正在加载模型进行预测: {model_path}")
 
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    def _clean_state_dict(state_dict):
+        if not isinstance(state_dict, dict):
+            return state_dict
+        if 'state_dict' in state_dict and isinstance(state_dict['state_dict'], dict):
+            state_dict = state_dict['state_dict']
+
+        cleaned = {}
+        for k, v in state_dict.items():
+            if k == 'n_averaged':
+                continue
+            new_key = k
+            if new_key.startswith('module.'):
+                new_key = new_key[len('module.'):]
+            cleaned[new_key] = v
+        return cleaned
+
+    ckpt = torch.load(model_path, map_location='cpu')
+    ckpt = _clean_state_dict(ckpt)
+    model.load_state_dict(ckpt, strict=True)
     model.to(device)
     model.eval()
 
