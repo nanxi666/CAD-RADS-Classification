@@ -1435,13 +1435,16 @@ def run_worker(rank, args):
             optimizer.zero_grad()
             for _ in range(args.warmup_steps):
                 try:
-                    x, y, vessel_idx, _, _ = next(warmup_iter)
+                    x, y, vessel_idx, _, _, _ = next(warmup_iter)
                 except StopIteration:
                     warmup_iter = iter(loader_wrapper)
-                    x, y, vessel_idx, _, _ = next(warmup_iter)
+                    x, y, vessel_idx, _, _, _ = next(warmup_iter)
                 x, y = x.to(device), y.to(device)
-                outputs = model(x, vessel_idx)
-                loss = criterion(outputs, y)
+                # Warmup 只跑一次 forward pass 即可，不需要包含完整 loss 计算逻辑
+                # 但为了图构建完整，最好保持和 training step 一致
+                logits, pct_pred = model(x, vessel_idx)
+                # 使用简单的 loss 跑通即可
+                loss = criterion(logits, y)
                 loss.backward()
                 if TPU_AVAILABLE and device.type == 'xla':
                     xm.optimizer_step(optimizer, barrier=True)
