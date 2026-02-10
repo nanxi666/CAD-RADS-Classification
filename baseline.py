@@ -530,7 +530,7 @@ class SiameseModel(nn.Module):
             feature_dim = self.backbone.num_features
         else:
             # 兼容部分没有 num_features 属性的模型
-            dummy = torch.randn(1, 1, 224, 224)
+            dummy = torch.randn(1, 3, 224, 224)
             out = self.backbone(dummy)
             feature_dim = out.shape[1]
 
