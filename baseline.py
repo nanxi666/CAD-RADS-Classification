@@ -1243,7 +1243,8 @@ def run_worker(rank, args):
     model.to(device)
 
     # 修改：使用 AdamW 代替 Adam，并应用 weight_decay 进行正则化
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
+    optimizer = optim.AdamW(model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
 
     if args.use_class_weights:
         class_weights = compute_class_weights_from_df(
