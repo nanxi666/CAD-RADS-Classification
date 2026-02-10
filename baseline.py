@@ -3,6 +3,7 @@ import re
 import random
 import argparse
 import time
+import logging
 from typing import List, Dict, Tuple
 
 import numpy as np
@@ -1105,8 +1106,21 @@ def run_worker(rank, args):
         device = get_device()
         is_master = True
 
+    logger = None
     if is_master:
         os.makedirs(args.output_dir, exist_ok=True)
+        log_path = os.path.join(args.output_dir, "train.log")
+        logger = logging.getLogger("train_logger")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if logger.handlers:
+            for h in list(logger.handlers):
+                logger.removeHandler(h)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(file_handler)
+
         print_config(args)
         prefix = "TPU Core" if is_tpu else "Device"
         dev_id = rank if is_tpu else device
@@ -1359,9 +1373,14 @@ def run_worker(rank, args):
         dt = time.time() - t0
 
         if is_master:
-            print(f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
-                  f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
-                  f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}")
+            log_msg = (
+                f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
+                f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
+                f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
+            )
+            print(log_msg)
+            if logger is not None:
+                logger.info(log_msg)
 
             if val_metrics['acc'] > best_acc:
                 best_acc = val_metrics['acc']
