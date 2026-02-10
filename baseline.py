@@ -508,7 +508,8 @@ class SiameseModel(nn.Module):
     """
 
     def __init__(self, model_name: str, num_classes: int, num_views: int,
-                 use_cls_token: bool = False, use_vessel_code: bool = False, vessel_emb_dim: int = 16):
+                 use_cls_token: bool = False, use_vessel_code: bool = False, vessel_emb_dim: int = 16,
+                 drop_path_rate: float = 0.0):
         super().__init__()
         self.num_views = num_views
         self.use_cls_token = use_cls_token
@@ -522,7 +523,7 @@ class SiameseModel(nn.Module):
             pretrained=True,
             num_classes=0,
             in_chans=3,
-            drop_path_rate=0
+            drop_path_rate=drop_path_rate
         )
 
         # 获取 Backbone 输出特征维度
@@ -1047,6 +1048,12 @@ def parse_args():
                         help='使用 vessel_code 条件向量')
     parser.add_argument('--vessel_emb_dim', type=int, default=16,
                         help='vessel_code 嵌入维度')
+    
+    # 正则化参数
+    parser.add_argument('--drop_path_rate', type=float, default=0.2,
+                        help='Backbone Stochastic Depth rate (防过拟合)')
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='AdamW Weight Decay (防过拟合)')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -1219,7 +1226,8 @@ def run_worker(rank, args):
                          num_classes=args.num_classes, num_views=args.num_views,
                          use_cls_token=args.use_cls_token,
                          use_vessel_code=args.use_vessel_code,
-                         vessel_emb_dim=args.vessel_emb_dim)
+                         vessel_emb_dim=args.vessel_emb_dim,
+                         drop_path_rate=args.drop_path_rate)
 
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
@@ -1234,8 +1242,8 @@ def run_worker(rank, args):
 
     model.to(device)
 
-    effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
-    optimizer = optim.Adam(model.parameters(), lr=effective_lr)
+    # 修改：使用 AdamW 代替 Adam，并应用 weight_decay 进行正则化
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if args.use_class_weights:
         class_weights = compute_class_weights_from_df(
