@@ -281,12 +281,12 @@ class EarlyStopping:
         if self.verbose:
             self.trace_func(
                 f'Validation metric improved. Current: {val_score:.6f}. Saving model ...')
-        
+
         # 解包 wrap (DataParallel, AveragedModel 等) 确保保存时的 key clean
         raw_model = model
         while hasattr(raw_model, 'module'):
             raw_model = raw_model.module
-            
+
         state_dict = raw_model.state_dict()
 
         if TPU_AVAILABLE:
@@ -383,9 +383,9 @@ class DabangDataset(Dataset):
                     A.MotionBlur(blur_limit=3, p=0.2),
                 ], p=0.3),
 
-                # 模拟遮挡/噪声
+                # 模拟遮挡/噪声 (增加概率 0.2 -> 0.5)
                 A.CoarseDropout(max_holes=8, max_height=img_size //
-                                10, max_width=img_size//10, p=0.2),
+                                10, max_width=img_size//10, p=0.5),
 
                 # 归一化 (使用 ImageNet 统计数据)
                 A.Normalize(mean=(0.485, 0.456, 0.406),
@@ -557,8 +557,8 @@ class SiameseModel(nn.Module):
             nn.TransformerEncoderLayer(
                 d_model=feature_dim,
                 nhead=nhead,
-                dim_feedforward=feature_dim * 4,
-                dropout=0.3,
+                dim_feedforward=feature_dim * 2,  # 降低 FFN 维度 (4->2) 减少参数量
+                dropout=0.5,                      # 增加 Dropout (0.3->0.5)
                 batch_first=True,
                 activation="gelu",
             ),
@@ -1064,12 +1064,14 @@ def parse_args():
                         help='使用 vessel_code 条件向量')
     parser.add_argument('--vessel_emb_dim', type=int, default=16,
                         help='vessel_code 嵌入维度')
-    
+
     # 正则化参数
-    parser.add_argument('--drop_path_rate', type=float, default=0.2,
+    parser.add_argument('--drop_path_rate', type=float, default=0.5,
                         help='Backbone Stochastic Depth rate (防过拟合)')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
+    parser.add_argument('--weight_decay', type=float, default=0.1,
                         help='AdamW Weight Decay (防过拟合)')
+    parser.add_argument('--droupout', type=float,
+                        default=0.3, help='分类头 Dropout 率 (防过拟合)')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -1103,7 +1105,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
     parser.add_argument('--mixup_alpha', type=float,
-                        default=0, help='MixUp alpha 参数 (0表示禁用)')
+                        default=0.8, help='MixUp alpha 参数 (0表示禁用)')
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='梯度累积步数 (用于降低显存占用)')
     parser.add_argument('--warmup_steps', type=int, default=1,
@@ -1260,7 +1262,8 @@ def run_worker(rank, args):
 
     # 修改：使用 AdamW 代替 Adam，并应用 weight_decay 进行正则化
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
 
     if args.use_class_weights:
         class_weights = compute_class_weights_from_df(
