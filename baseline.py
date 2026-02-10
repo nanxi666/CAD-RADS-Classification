@@ -417,6 +417,8 @@ class DabangDataset(Dataset):
 
             # 1. 标签处理
             label = -1
+            pct_val = 0.0  # 默认百分比
+
             if not self.is_test:
                 # 优先直接使用分类标签，缺失时通过百分比转换
                 if pd.notna(row.get('stenosis_class')):
@@ -424,6 +426,12 @@ class DabangDataset(Dataset):
                 else:
                     pct = row.get('stenosis_percentage', 0)
                     label = pct_to_class_6(float(pct))
+
+                # 获取百分比 (归一化到 0-1) 用于回归
+                raw_pct = row.get('stenosis_percentage', 0.0)
+                if pd.isna(raw_pct):
+                    raw_pct = 0.0
+                pct_val = float(raw_pct) / 100.0
 
             # 2. 图像查找
             img_files = find_multiview_images(self.image_root, rid)
@@ -442,7 +450,7 @@ class DabangDataset(Dataset):
             pid = str(row.get('pid', rid)).strip()
             vessel_code = str(row.get('vessel_code', '')).upper().strip()
             vessel_idx = self.vessel_map.get(vessel_code, 0)
-            samples.append((paths, label, vessel_idx, rid, pid))
+            samples.append((paths, label, vessel_idx, rid, pid, pct_val))
 
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"索引构建完成，有效样本数: {len(samples)}")
@@ -452,7 +460,7 @@ class DabangDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, label, vessel_idx, rid, pid = self.samples[idx]
+        paths, label, vessel_idx, rid, pid, pct_val = self.samples[idx]
         tensors = []
 
         for p in paths:
@@ -472,7 +480,7 @@ class DabangDataset(Dataset):
 
         # 堆叠视图 -> [Num_Views, 3, H, W]
         x = torch.stack(tensors, dim=0)
-        return x, label, vessel_idx, rid, pid
+        return x, label, vessel_idx, rid, pid, torch.tensor(pct_val, dtype=torch.float32)
 
 # -------------------------------------------------------------------------
 # 模型定义
@@ -582,6 +590,15 @@ class SiameseModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
+        # 5. 回归头 (Sigmoid -> 0-1)
+        self.regressor = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
     def forward(self, x, vessel_idx=None):
         # x shape: [Batch, Views, 3, H, W]
         b, v, c, h, w = x.shape
@@ -621,8 +638,12 @@ class SiameseModel(nn.Module):
             pooled = fused.mean(dim=1)
 
         # 6. 分类
-        out = self.classifier(pooled)
-        return out
+        logits = self.classifier(pooled)
+
+        # 7. 回归
+        pct_pred = self.regressor(pooled)
+
+        return logits, pct_pred
 
 # -------------------------------------------------------------------------
 # 训练与验证流程
@@ -729,20 +750,37 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if (swa_model is not None) and (epoch >= swa_start):
             swa_model.update_parameters(model)
 
-    for step, (x, y, vessel_idx, _, _) in enumerate(iter_loader):
-        x, y = x.to(device), y.to(device)
+    for step, (x, y, vessel_idx, _, _, pct) in enumerate(iter_loader):
+        x, y, pct = x.to(device), y.to(device), pct.to(device)
 
         # Mixup处理
         use_mixup = (mixup_alpha > 0)
 
+        reg_criterion = nn.MSELoss()
+
         if TPU_AVAILABLE:
             if use_mixup:
+                # Mixup for classification labels
                 x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
-                outputs = model(x, vessel_idx)
-                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+                logits, pct_pred = model(x, vessel_idx)
+
+                loss_cls = mixup_criterion(criterion, logits, y_a, y_b, lam)
+
+                # 回归 Loss 暂不 Mixup，直接计算(需改进)或忽略
+                # 简单起见，对回归 Loss 应用同样的 mixup 权重
+                # 注意：这里我们无法获得 shuffle index，所以无法 mixup 回归 target
+                # 因此：如果开启 Mixup，我们暂时只对分类做 Mixup Loss，回归 Loss 仍用原始 Target (可能产生冲突，但权重大)
+                # 或者：为了稳定，如果 Mixup 开启, 回归 Loss 权重设为 0? 不行。
+                # 最佳方案：Mixup 时禁用 Regression loss? 或者只做分类。
+                # 折中：计算原始 Regression Loss
+                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+
+                loss = loss_cls + 10.0 * loss_reg
             else:
-                outputs = model(x, vessel_idx)
-                loss = criterion(outputs, y)
+                logits, pct_pred = model(x, vessel_idx)
+                loss_cls = criterion(logits, y)
+                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+                loss = loss_cls + 10.0 * loss_reg
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -758,12 +796,18 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    outputs = model(x, vessel_idx)
+                    logits, pct_pred = model(x, vessel_idx)
+
                     if use_mixup:
-                        loss = mixup_criterion(
-                            criterion, outputs, y_a, y_b, lam)
+                        loss_cls = mixup_criterion(
+                            criterion, logits, y_a, y_b, lam)
                     else:
-                        loss = criterion(outputs, y)
+                        loss_cls = criterion(logits, y)
+
+                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+
+                    loss = loss_cls + 10.0 * loss_reg
+
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
@@ -771,11 +815,17 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     _update_ema_swa()
                     optimizer.zero_grad()
             else:
-                outputs = model(x, vessel_idx)
+                logits, pct_pred = model(x, vessel_idx)
+
                 if use_mixup:
-                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+                    loss_cls = mixup_criterion(
+                        criterion, logits, y_a, y_b, lam)
                 else:
-                    loss = criterion(outputs, y)
+                    loss_cls = criterion(logits, y)
+
+                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+                loss = loss_cls + 10.0 * loss_reg
+
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     optimizer.step()
@@ -785,7 +835,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # 统计指标
         with torch.no_grad():
             running_loss += loss.item()
-            _, predicted = outputs.max(1)
+            _, predicted = logits.max(1)
             total += y.size(0)
 
             if use_mixup:
@@ -848,7 +898,11 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # 如果追求精确，应该记录 loss * batch_size 然后 all_reduce sum
 
         total_steps = len(loader)  # per core
-        return running_loss / total_steps, correct / (total_sum if total_sum > 0 else 1)
+
+        # 修正 TPU Loss 统计：running_loss 是所有核 sum 起来的，需要除以 world_size
+        avg_loss = running_loss / (total_steps * xr.world_size())
+
+        return avg_loss, correct / (total_sum if total_sum > 0 else 1)
 
     return running_loss / len(loader), correct / total
 
@@ -871,14 +925,15 @@ def validate(model, loader, device, criterion, num_classes=6):
                        leave=False) if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, y, vessel_idx, _, _ in iter_loader:
-            x, y = x.to(device), y.to(device)
-            outputs = model(x, vessel_idx)
-            loss = criterion(outputs, y)
+        for x, y, vessel_idx, _, _, pct in iter_loader:
+            x, y, pct = x.to(device), y.to(device), pct.to(device)
+            logits, pct_pred = model(x, vessel_idx)
+            loss = criterion(logits, y) + 10.0 * \
+                nn.MSELoss()(pct_pred.view(-1), pct.view(-1))
 
             running_loss += loss.item()
 
-            _, preds = outputs.max(1)
+            _, preds = logits.max(1)
             indices = y * num_classes + preds
             batch_conf_mat = torch.bincount(indices, minlength=num_classes**2)
             confusion_matrix += batch_conf_mat.view(num_classes, num_classes)
@@ -988,17 +1043,20 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
     with torch.no_grad():
         for x, _, vessel_idx, rids, pids in iter_loader:
             x = x.to(device)
-            outputs = model(x, vessel_idx)
+            logits, pct_pred = model(x, vessel_idx)
 
             x_flip = torch.flip(x, dims=[-1])
-            outputs_flip = model(x_flip, vessel_idx)
-            outputs = (outputs + outputs_flip) / 2
+            logits_flip, pct_flip = model(x_flip, vessel_idx)
 
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            preds = outputs.argmax(1).cpu().numpy()
+            logits = (logits + logits_flip) / 2
+            pct_final = (pct_pred + pct_flip) / 2
 
-            for rid, pid, pred, prob in zip(rids, pids, preds, probs):
-                row = {'ID': rid, 'Prediction': pred}
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds = logits.argmax(1).cpu().numpy()
+            pcts = pct_final.cpu().numpy().flatten()
+
+            for rid, pid, pred, prob, reg_val in zip(rids, pids, preds, probs, pcts):
+                row = {'ID': rid, 'Prediction': pred, 'reg_pct': reg_val}
                 for i, p in enumerate(prob):
                     row[f'prob_{i}'] = p
                 results.append(row)
