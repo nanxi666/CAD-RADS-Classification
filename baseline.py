@@ -281,16 +281,21 @@ class EarlyStopping:
         if self.verbose:
             self.trace_func(
                 f'Validation metric improved. Current: {val_score:.6f}. Saving model ...')
+        
+        # 解包 wrap (DataParallel, AveragedModel 等) 确保保存时的 key clean
+        raw_model = model
+        while hasattr(raw_model, 'module'):
+            raw_model = raw_model.module
+            
+        state_dict = raw_model.state_dict()
+
         if TPU_AVAILABLE:
             if xr.global_ordinal() == 0:
-                cpu_state_dict = {k: v.cpu()
-                                  for k, v in model.state_dict().items()}
+                cpu_state_dict = {k: v.cpu() for k, v in state_dict.items()}
                 torch.save(cpu_state_dict, self.path)
                 del cpu_state_dict
         else:
-            start_state_dict = model.module.state_dict() if isinstance(
-                model, nn.DataParallel) else model.state_dict()
-            torch.save(start_state_dict, self.path)
+            torch.save(state_dict, self.path)
 
 
 def find_multiview_images(image_root: str, record_id: str, cache: Dict[str, List[str]] = {}) -> List[str]:
@@ -953,7 +958,18 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
     if (not TPU_AVAILABLE) or (xr.global_ordinal() == 0):
         print(f"\n正在加载模型进行预测: {model_path}")
 
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    # 加载权重并处理可能的 DataParallel/AveragedModel 前缀
+    checkpoint = torch.load(model_path, map_location='cpu')
+    new_state_dict = {}
+    for k, v in checkpoint.items():
+        if k == 'n_averaged':
+            continue
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+    model.load_state_dict(new_state_dict)
+
     model.to(device)
     model.eval()
 
