@@ -562,10 +562,12 @@ class SiameseModel(nn.Module):
         # 3. vessel_code 条件向量
         if self.use_vessel_code:
             # 0=unknown, 1=LAD, 2=LCX, 3=RCA
-            self.vessel_emb = nn.Embedding(4, vessel_emb_dim)
+            # 修改：使用 feature_dim 维度，以便直接加到 Transformer 输入特征中 (Early Fusion)
+            self.vessel_emb = nn.Embedding(4, feature_dim)
 
-        # 4. 分类头 (输入为融合后的 feature_dim [+ vessel_emb_dim])
-        in_dim = feature_dim + (vessel_emb_dim if self.use_vessel_code else 0)
+        # 4. 分类头 (输入为融合后的 feature_dim)
+        # 修改：vessel_code 已融合进特征，因此输入维度仅为 feature_dim
+        in_dim = feature_dim
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
             nn.Linear(in_dim, 512),
@@ -592,23 +594,25 @@ class SiameseModel(nn.Module):
             cls_tok = self.cls_token.expand(b, -1, -1)
             features = torch.cat([cls_tok, features], dim=1)
 
+        # 融入 vessel_code (Early Fusion)
+        if self.use_vessel_code:
+            if vessel_idx is None:
+                vessel_vec = torch.zeros(
+                    (b, 1, features.shape[-1]), device=features.device)
+            else:
+                vessel_idx = vessel_idx.to(
+                    features.device).long().clamp(min=0, max=3)
+                vessel_vec = self.vessel_emb(
+                    vessel_idx).unsqueeze(1)  # [B, 1, F]
+            # 广播相加：让每个视角的特征都感知到血管类型
+            features = features + vessel_vec
+
         features = features + self.view_pos
         fused = self.view_encoder(features)
         if self.use_cls_token:
             pooled = fused[:, 0]
         else:
             pooled = fused.mean(dim=1)
-
-        # 5. 拼接 vessel_code 条件向量
-        if self.use_vessel_code:
-            if vessel_idx is None:
-                vessel_feat = torch.zeros(
-                    (b, self.vessel_emb_dim), device=pooled.device)
-            else:
-                vessel_idx = vessel_idx.to(
-                    pooled.device).long().clamp(min=0, max=3)
-                vessel_feat = self.vessel_emb(vessel_idx)
-            pooled = torch.cat([pooled, vessel_feat], dim=1)
 
         # 6. 分类
         out = self.classifier(pooled)
