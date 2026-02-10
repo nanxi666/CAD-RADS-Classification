@@ -19,7 +19,7 @@ from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 import timm
@@ -1111,6 +1111,11 @@ def parse_args():
     parser.add_argument('--warmup_steps', type=int, default=1,
                         help='训练前 warmup 步数（用于摊薄 TPU 首轮编译成本）')
 
+    # K-Fold 参数
+    parser.add_argument('--n_folds', type=int, default=5, help='K-Fold 交叉验证折数')
+    parser.add_argument('--selected_fold', type=int, default=-1,
+                        help='仅运行特定折 (-1 表示运行所有折)')
+
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
                         required=False, help='Jupyter kernel file (ignore)')
@@ -1171,315 +1176,377 @@ def run_worker(rank, args):
                 r'\d+', x)[0] if re.findall(r'\d+', x) else x)
 
     pids = train_val_df['pid'].unique()
-    train_pids, val_pids = train_test_split(
-        pids, test_size=0.15, random_state=args.seed)
-    train_df = train_val_df[train_val_df['pid'].isin(train_pids)].copy()
-    val_df = train_val_df[train_val_df['pid'].isin(val_pids)].copy()
 
-    test_root = args.test_img_root if os.path.exists(
-        args.test_img_root) else args.img_root
+    # K-Fold 分层逻辑
+    if 'stenosis_class' not in train_val_df.columns:
+        train_val_df['stenosis_class'] = train_val_df['stenosis_percentage'].apply(
+            lambda p: pct_to_class_6(float(p)))
+    train_val_df['stratify_label'] = train_val_df['stenosis_class'].fillna(
+        0).astype(int)
 
-    train_ds = DabangDataset(train_df, args.img_root,
-                             num_views=args.num_views, augment=True)
-    val_ds = DabangDataset(val_df, args.img_root,
-                           num_views=args.num_views, augment=False)
+    skf = StratifiedGroupKFold(
+        n_splits=args.n_folds, shuffle=True, random_state=args.seed)
 
-    if not test_df.empty:
-        test_ds = DabangDataset(
-            test_df, test_root, num_views=args.num_views, is_test=True)
-    else:
-        test_ds = None
-
-    loader_num_workers = 0 if is_tpu else args.num_workers
-    if (not is_tpu) and os.name == "nt" and loader_num_workers > 0:
-        if is_master:
-            print("检测到 Windows 环境，num_workers>0 可能导致 DataLoader 卡住，已自动设为 0")
-        loader_num_workers = 0
-    if is_tpu and args.tpu_batch_is_global:
-        per_core_batch = max(1, args.batch_size // xr.world_size())
-    else:
-        per_core_batch = args.batch_size
-    if is_master and is_tpu:
-        print(
-            f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
-
-    loader_args = {
-        'batch_size': per_core_batch,
-        'num_workers': loader_num_workers,
-        'pin_memory': not is_tpu,
-        'drop_last': False  # 用户要求保留所有数据
-    }
-    if loader_num_workers > 0:
-        loader_args['persistent_workers'] = False
-
-    if is_tpu:
-        # 用户数据量少，不想丢弃数据，因此设为 False。
-        # 注意: 这可能会导致每个 Epoch 最后一个 Batch 触发 TPU 重编译，稍微拖慢一点点末尾速度，但能保留数据。
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=False)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
-
-        train_loader = DataLoader(
-            train_ds, sampler=train_sampler, **loader_args)
-        val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
-
-        if test_ds:
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                test_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
-            test_loader = DataLoader(
-                test_ds, sampler=test_sampler, **loader_args)
-        else:
-            test_loader = []
-    else:
-        train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
-        val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
-        test_loader = DataLoader(
-            test_ds, shuffle=False, **loader_args) if test_ds else []
-
+    # 打印 K-Fold 信息
     if is_master:
-        print(f"初始化 SiameseModel ({args.model}) ...")
+        print(f"启动 {args.n_folds} 折交叉验证...")
 
-    model = SiameseModel(model_name=args.model,
-                         num_classes=args.num_classes, num_views=args.num_views,
-                         use_cls_token=args.use_cls_token,
-                         use_vessel_code=args.use_vessel_code,
-                         vessel_emb_dim=args.vessel_emb_dim,
-                         drop_path_rate=args.drop_path_rate)
+    # 对全量 train/val 数据进行划分
+    fold_generator = list(skf.split(
+        train_val_df, train_val_df['stratify_label'], groups=train_val_df['pid']))
 
-    model = try_enable_sync_batchnorm(
-        model, is_tpu=is_tpu, is_master=is_master)
-    if is_tpu:
-        model = replace_batchnorm_with_groupnorm(
-            model, num_groups=16, is_master=is_master)
-
-    if (not is_tpu) and (torch.cuda.device_count() > 1):
-        if is_master:
-            print(f"检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel 并行训练")
-        model = nn.DataParallel(model)
-
-    model.to(device)
-
-    # 修改：使用 AdamW 代替 Adam，并应用 weight_decay 进行正则化
-    effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
-    optimizer = optim.AdamW(
-        model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
-
-    if args.use_class_weights:
-        class_weights = compute_class_weights_from_df(
-            train_df, args.num_classes).to(device)
-        if is_master:
-            print(f"已启用类别权重: {class_weights.tolist()}")
-    else:
-        class_weights = None
-        if is_master:
-            print("未启用类别权重 (优化 Accuracy)")
-
-    # 选择损失函数
-    if args.loss_type == 'focal':
-        criterion = FocalLoss(
-            alpha=class_weights,
-            gamma=args.focal_gamma,
-            label_smoothing=args.label_smoothing
-        )
-        if is_master:
-            print(f"使用 FocalLoss (gamma={args.focal_gamma})")
-    else:
-        criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=args.label_smoothing
-        )
-        if is_master:
-            print("使用 CrossEntropyLoss")
-
-    scaler = torch.cuda.amp.GradScaler() if (
-        not is_tpu and torch.cuda.is_available()) else None
-
-    scheduler = build_warmup_cosine_scheduler(
-        optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs)
-
-    ema_model = None
-    if args.use_ema:
-        def _ema_avg_fn(averaged_param, param, num_averaged):
-            return averaged_param * args.ema_decay + param * (1.0 - args.ema_decay)
-
-        ema_model = AveragedModel(model, avg_fn=_ema_avg_fn).to(device)
-
-    swa_model = None
-    swa_scheduler = None
-    if args.use_swa:
-        swa_model = AveragedModel(model).to(device)
-        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
-
-    def master_print(*args_p, **kwargs_p):
-        if is_master:
-            print(*args_p, **kwargs_p)
-
-    # ---------------------------------------------------------------------
-    # 策略修改: 同时监控 Acc, F1, Loss 三个指标
-    # 只有当三个指标都耗尽耐心(Patience)时，才触发早停。
-    # 这样可以确保模型在任何一个维度仍有进步空间时继续训练。
-    # ---------------------------------------------------------------------
-
-    # 1. Accuracy Monitor (Max)
-    es_acc = EarlyStopping(
-        patience=args.patience,
-        verbose=True,
-        path=os.path.join(args.output_dir, 'best_model.pt'),
-        trace_func=lambda s: master_print(f"[ES-Acc] {s}"),
-        mode='max'
-    )
-
-    # 2. F1 Monitor (Max)
-    es_f1_monitor = EarlyStopping(
-        patience=args.patience,
-        verbose=True,
-        path=os.path.join(args.output_dir, 'best_model_f1.pt'),
-        trace_func=lambda s: master_print(f"[ES-F1] {s}"),
-        mode='max'
-    )
-
-    # 3. Loss Monitor (Min)
-    es_loss_monitor = EarlyStopping(
-        patience=args.patience,
-        verbose=True,
-        path=os.path.join(args.output_dir, 'best_model_loss.pt'),
-        trace_func=lambda s: master_print(f"[ES-Loss] {s}"),
-        mode='min'
-    )
-
-    best_acc = 0.0
-    best_loss = float('inf')
-
-    if is_master:
-        print(f"开始训练流程... (联合早停策略: 等待 Acc/F1/Loss 全部停止改善)")
-        print(f"Warmup {args.warmup_steps} step(s)...")
-    if args.warmup_steps > 0:
-        model.train()
-        loader_wrapper = train_loader
-        if TPU_AVAILABLE and device.type == 'xla':
-            loader_wrapper = pl.ParallelLoader(
-                train_loader, [device]).per_device_loader(device)
-        warmup_iter = iter(loader_wrapper)
-        optimizer.zero_grad()
-        for _ in range(args.warmup_steps):
-            try:
-                x, y, vessel_idx, _, _ = next(warmup_iter)
-            except StopIteration:
-                warmup_iter = iter(loader_wrapper)
-                x, y, vessel_idx, _, _ = next(warmup_iter)
-            x, y = x.to(device), y.to(device)
-            outputs = model(x, vessel_idx)
-            loss = criterion(outputs, y)
-            loss.backward()
-            if TPU_AVAILABLE and device.type == 'xla':
-                xm.optimizer_step(optimizer, barrier=True)
-                xm.mark_step()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-        if TPU_AVAILABLE and device.type == 'xla':
-            xm.rendezvous("warmup_done")
-
-    for epoch in range(args.epochs):
-        t0 = time.time()
-
-        if is_tpu:
-            train_sampler.set_epoch(epoch)
-
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, scaler,
-            mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
-            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
-
-        if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
-            swa_scheduler.step()
-        else:
-            scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-
-        eval_model = ema_model if (ema_model is not None) else model
-        val_metrics = validate(eval_model, val_loader, device,
-                               criterion, num_classes=args.num_classes)
-
-        dt = time.time() - t0
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_generator):
+        if args.selected_fold != -1 and fold_idx != args.selected_fold:
+            continue
 
         if is_master:
-            log_msg = (
-                f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
-                f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
-                f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
-            )
-            print(log_msg)
+            print(f"\n{'='*30} Fold {fold_idx + 1} / {args.n_folds} {'='*30}")
             if logger is not None:
-                logger.info(log_msg)
+                logger.info(f"Starting Fold {fold_idx + 1} / {args.n_folds}")
 
-            if val_metrics['acc'] > best_acc:
-                best_acc = val_metrics['acc']
-                # 注: 具体的保存逻辑已移交给 es_acc_monitor，此处仅做记录或日志打印
-                # (之前的 print 和 save 逻辑已由 EarlyStopping 接管)
-                if is_master:
-                    print(f"  >>> [Acc] new high: {best_acc:.4f}")
+        # 切分 Dataframe
+        train_df = train_val_df.iloc[train_idx].copy()
+        val_df = train_val_df.iloc[val_idx].copy()
 
-            if val_metrics['loss'] < best_loss:
-                best_loss = val_metrics['loss']
-                # 注: 具体的保存逻辑已移交给 es_loss_monitor
+        test_root = args.test_img_root if os.path.exists(
+            args.test_img_root) else args.img_root
 
-        # 更新三个早停监控器
-        es_acc(val_metrics['acc'], eval_model)
-        es_f1_monitor(val_metrics['f1'], eval_model)
-        es_loss_monitor(val_metrics['loss'], eval_model)
+        train_ds = DabangDataset(train_df, args.img_root,
+                                 num_views=args.num_views, augment=True)
+        val_ds = DabangDataset(val_df, args.img_root,
+                               num_views=args.num_views, augment=False)
 
-        # 联合早停检查：只有当三个都触发 Early Stop 时才真正停止
-        stop_flag = False
-        if es_acc.early_stop and es_f1_monitor.early_stop and es_loss_monitor.early_stop:
-            stop_flag = True
-
-        if is_tpu:
-            flag_tensor = torch.tensor(
-                1 if stop_flag else 0, dtype=torch.int, device=device)
-            xm.all_reduce('max', [flag_tensor])
-            stop_flag = (flag_tensor.item() > 0)
-
-        if stop_flag:
-            if is_master:
-                print("Early stopping triggered!")
-            break
-
-    if args.use_swa and (swa_model is not None):
-        if is_master:
-            print("\n开始更新 SWA BN 统计...")
-        if not is_tpu:
-            update_bn(train_loader, swa_model, device=device)
+        if not test_df.empty:
+            test_ds = DabangDataset(
+                test_df, test_root, num_views=args.num_views, is_test=True)
         else:
+            test_ds = None
+
+        loader_num_workers = 0 if is_tpu else args.num_workers
+        if (not is_tpu) and os.name == "nt" and loader_num_workers > 0:
             if is_master:
-                print("TPU 环境下跳过 SWA 的 BN 更新")
+                print("检测到 Windows 环境，num_workers>0 可能导致 DataLoader 卡住，已自动设为 0")
+            loader_num_workers = 0
+        if is_tpu and args.tpu_batch_is_global:
+            per_core_batch = max(1, args.batch_size // xr.world_size())
+        else:
+            per_core_batch = args.batch_size
+        if is_master and is_tpu:
+            print(
+                f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
+
+        loader_args = {
+            'batch_size': per_core_batch,
+            'num_workers': loader_num_workers,
+            'pin_memory': not is_tpu,
+            'drop_last': False
+        }
+        if loader_num_workers > 0:
+            loader_args['persistent_workers'] = False
+
+        # 初始化 Loaders (每次 Fold 重新初始化)
+        if is_tpu:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=False)
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
+            train_loader = DataLoader(
+                train_ds, sampler=train_sampler, **loader_args)
+            val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
+            if test_ds:
+                test_sampler = torch.utils.data.distributed.DistributedSampler(
+                    test_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
+                test_loader = DataLoader(
+                    test_ds, sampler=test_sampler, **loader_args)
+            else:
+                test_loader = []
+        else:
+            train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
+            val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
+            test_loader = DataLoader(
+                test_ds, shuffle=False, **loader_args) if test_ds else []
+
+        # 模型初始化
+        if is_master:
+            print(f"初始化 SiameseModel ({args.model}) ...")
+
+        model = SiameseModel(model_name=args.model,
+                             num_classes=args.num_classes, num_views=args.num_views,
+                             use_cls_token=args.use_cls_token,
+                             use_vessel_code=args.use_vessel_code,
+                             vessel_emb_dim=args.vessel_emb_dim,
+                             drop_path_rate=args.drop_path_rate)
+
+        model = try_enable_sync_batchnorm(
+            model, is_tpu=is_tpu, is_master=is_master)
+        if is_tpu:
+            model = replace_batchnorm_with_groupnorm(
+                model, num_groups=16, is_master=is_master)
+
+        if (not is_tpu) and (torch.cuda.device_count() > 1):
+            if is_master:
+                print(
+                    f"检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel 并行训练")
+            model = nn.DataParallel(model)
+
+        model.to(device)
+
+        effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
+        optimizer = optim.AdamW(
+            model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
+
+        if args.use_class_weights:
+            class_weights = compute_class_weights_from_df(
+                train_df, args.num_classes).to(device)
+            if is_master:
+                print(f"已启用类别权重: {class_weights.tolist()}")
+        else:
+            class_weights = None
+            if is_master:
+                print("未启用类别权重 (优化 Accuracy)")
+
+        if args.loss_type == 'focal':
+            criterion = FocalLoss(
+                alpha=class_weights,
+                gamma=args.focal_gamma,
+                label_smoothing=args.label_smoothing
+            )
+        else:
+            criterion = nn.CrossEntropyLoss(
+                weight=class_weights,
+                label_smoothing=args.label_smoothing
+            )
+
+        scaler = torch.cuda.amp.GradScaler() if (
+            not is_tpu and torch.cuda.is_available()) else None
+
+        scheduler = build_warmup_cosine_scheduler(
+            optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs)
+
+        ema_model = None
+        if args.use_ema:
+            def _ema_avg_fn(averaged_param, param, num_averaged):
+                return averaged_param * args.ema_decay + param * (1.0 - args.ema_decay)
+            ema_model = AveragedModel(model, avg_fn=_ema_avg_fn).to(device)
+
+        swa_model = None
+        swa_scheduler = None
+        if args.use_swa:
+            swa_model = AveragedModel(model).to(device)
+            swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
+
+        def master_print(*args_p, **kwargs_p):
+            if is_master:
+                print(*args_p, **kwargs_p)
+
+        # Early Stopping Monitors with Fold Suffix
+        es_acc = EarlyStopping(
+            patience=args.patience, verbose=True,
+            path=os.path.join(
+                args.output_dir, f'best_model_fold_{fold_idx}.pt'),
+            trace_func=lambda s: master_print(f"[ES-Acc] {s}"), mode='max'
+        )
+        es_f1_monitor = EarlyStopping(
+            patience=args.patience, verbose=True,
+            path=os.path.join(
+                args.output_dir, f'best_model_f1_fold_{fold_idx}.pt'),
+            trace_func=lambda s: master_print(f"[ES-F1] {s}"), mode='max'
+        )
+        es_loss_monitor = EarlyStopping(
+            patience=args.patience, verbose=True,
+            path=os.path.join(
+                args.output_dir, f'best_model_loss_fold_{fold_idx}.pt'),
+            trace_func=lambda s: master_print(f"[ES-Loss] {s}"), mode='min'
+        )
+
+        best_acc = 0.0
+        best_loss = float('inf')
 
         if is_master:
-            swa_path = os.path.join(args.output_dir, "swa_model.pt")
-            state_dict = swa_model.module.state_dict() if isinstance(
-                swa_model, nn.DataParallel) else swa_model.state_dict()
-            torch.save(state_dict, swa_path)
-            print(f"SWA 模型已保存至: {swa_path}")
+            print(f"开始 Fold {fold_idx+1} 训练流程... (联合早停策略)")
+            print(f"Warmup {args.warmup_steps} step(s)...")
 
-    if test_loader:
-        if is_master:
-            print("\n开始测试集预测...")
+        # Warmup
+        if args.warmup_steps > 0:
+            model.train()
+            loader_wrapper = train_loader
+            if TPU_AVAILABLE and device.type == 'xla':
+                loader_wrapper = pl.ParallelLoader(
+                    train_loader, [device]).per_device_loader(device)
+            warmup_iter = iter(loader_wrapper)
+            optimizer.zero_grad()
+            for _ in range(args.warmup_steps):
+                try:
+                    x, y, vessel_idx, _, _ = next(warmup_iter)
+                except StopIteration:
+                    warmup_iter = iter(loader_wrapper)
+                    x, y, vessel_idx, _, _ = next(warmup_iter)
+                x, y = x.to(device), y.to(device)
+                outputs = model(x, vessel_idx)
+                loss = criterion(outputs, y)
+                loss.backward()
+                if TPU_AVAILABLE and device.type == 'xla':
+                    xm.optimizer_step(optimizer, barrier=True)
+                    xm.mark_step()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+            if TPU_AVAILABLE and device.type == 'xla':
+                xm.rendezvous("warmup_done")
 
-        best_acc_path = os.path.join(args.output_dir, "best_model.pt")
-        if os.path.exists(best_acc_path):
-            run_inference(best_acc_path, "test_predictions_acc.csv",
-                          test_loader, model, device, args)
+        # Epoch Loop
+        for epoch in range(args.epochs):
+            t0 = time.time()
+            if is_tpu:
+                train_sampler.set_epoch(epoch)
 
-        best_f1_path = os.path.join(args.output_dir, "best_model_f1.pt")
-        if os.path.exists(best_f1_path):
-            run_inference(best_f1_path, "test_predictions_f1.csv",
-                          test_loader, model, device, args)
+            train_loss, train_acc = train_epoch(
+                model, train_loader, optimizer, criterion, device, scaler,
+                mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
+                ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
 
-        best_loss_path = os.path.join(args.output_dir, "best_model_loss.pt")
-        if os.path.exists(best_loss_path):
-            run_inference(best_loss_path, "test_predictions_loss.csv",
-                          test_loader, model, device, args)
+            if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
+                swa_scheduler.step()
+            else:
+                scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+
+            eval_model = ema_model if (ema_model is not None) else model
+            val_metrics = validate(eval_model, val_loader, device,
+                                   criterion, num_classes=args.num_classes)
+
+            dt = time.time() - t0
+
+            if is_master:
+                log_msg = (
+                    f"Fold {fold_idx+1} Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
+                    f"Train: L={train_loss:.4f} A={train_acc:.4f} | "
+                    f"Val: L={val_metrics['loss']:.4f} A={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
+                )
+                print(log_msg)
+                if logger is not None:
+                    logger.info(log_msg)
+
+                if val_metrics['acc'] > best_acc:
+                    best_acc = val_metrics['acc']
+
+                if val_metrics['loss'] < best_loss:
+                    best_loss = val_metrics['loss']
+
+            es_acc(val_metrics['acc'], eval_model)
+            es_f1_monitor(val_metrics['f1'], eval_model)
+            es_loss_monitor(val_metrics['loss'], eval_model)
+
+            stop_flag = False
+            if es_acc.early_stop and es_f1_monitor.early_stop and es_loss_monitor.early_stop:
+                stop_flag = True
+
+            if is_tpu:
+                flag_tensor = torch.tensor(
+                    1 if stop_flag else 0, dtype=torch.int, device=device)
+                xm.all_reduce('max', [flag_tensor])
+                stop_flag = (flag_tensor.item() > 0)
+
+            if stop_flag:
+                if is_master:
+                    print("Early stopping triggered for this fold!")
+                break
+
+        # SWA Saving
+        if args.use_swa and (swa_model is not None):
+            if is_master:
+                print("\n开始更新 SWA BN 统计...")
+            if not is_tpu:
+                update_bn(train_loader, swa_model, device=device)
+            if is_master:
+                swa_path = os.path.join(
+                    args.output_dir, f"swa_model_fold_{fold_idx}.pt")
+                state_dict = swa_model.module.state_dict() if isinstance(
+                    swa_model, nn.DataParallel) else swa_model.state_dict()
+                torch.save(state_dict, swa_path)
+                print(f"SWA 模型已保存至: {swa_path}")
+
+        # Fold Inference
+        if test_loader:
+            if is_master:
+                print(f"\n开始 Fold {fold_idx+1} 测试集预测...")
+
+            # 预测 Best ACC 模型
+            best_acc_path = os.path.join(
+                args.output_dir, f"best_model_fold_{fold_idx}.pt")
+            if os.path.exists(best_acc_path):
+                run_inference(best_acc_path, f"test_predictions_acc_fold_{fold_idx}.csv",
+                              test_loader, model, device, args)
+
+            # 预测 Best F1 模型
+            best_f1_path = os.path.join(
+                args.output_dir, f"best_model_f1_fold_{fold_idx}.pt")
+            if os.path.exists(best_f1_path):
+                run_inference(best_f1_path, f"test_predictions_f1_fold_{fold_idx}.csv",
+                              test_loader, model, device, args)
+
+        # 清理内存
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+        if is_tpu:
+            xm.mark_step()
+
+    # 所有 Folds 结束后的 Ensemble (仅 Master 执行)
+    if is_master and test_df is not None and not test_df.empty:
+        print("\n" + "="*40)
+        print("开始合并 K-Fold 预测结果...")
+        print("="*40)
+
+        # 针对 Acc 和 F1 分别做 ensemble
+        for metric_name in ['test_predictions_acc', 'test_predictions_f1']:
+            all_preds = []
+            valid_folds = 0
+
+            # 读取所有 folds
+            for f_idx in range(args.n_folds):
+                f_name = f"{metric_name}_fold_{f_idx}.csv"
+                f_path = os.path.join(args.output_dir, f_name)
+
+                if os.path.exists(f_path):
+                    df_pred = pd.read_csv(f_path)
+                    # 假设 CSV 包含: ID, Prediction, prob_0, prob_1...
+                    prob_cols = [
+                        c for c in df_pred.columns if c.startswith('prob_')]
+                    prob_cols.sort()  # 确保 prob_0, prob_1 ... 顺序
+
+                    if not prob_cols:
+                        continue
+
+                    # 按 ID 排序确保对齐
+                    df_pred = df_pred.sort_values('ID').reset_index(drop=True)
+                    all_preds.append(df_pred[prob_cols].values)
+                    valid_folds += 1
+
+            if valid_folds > 0:
+                # 平均概率
+                avg_probs = np.mean(all_preds, axis=0)  # [N, 6]
+                final_preds = np.argmax(avg_probs, axis=1)  # [N]
+
+                # 读取 ID
+                sample_df = pd.read_csv(os.path.join(
+                    args.output_dir, f"{metric_name}_fold_0.csv")).sort_values('ID')
+                ids = sample_df['ID'].values
+
+                # 构建最终 DataFrame
+                ensemble_res = []
+                for i, rid in enumerate(ids):
+                    row = {'ID': rid, 'Prediction': final_preds[i]}
+                    # 也可以保存 ensemble 后的概率
+                    # for c, p in enumerate(avg_probs[i]):
+                    #     row[f'prob_{c}'] = p
+                    ensemble_res.append(row)
+
+                ens_out = os.path.join(
+                    args.output_dir, f"ensemble_{metric_name}.csv")
+                pd.DataFrame(ensemble_res).to_csv(ens_out, index=False)
+                print(f"[{metric_name}] Ensemble 结果已保存至: {ens_out}")
+            else:
+                print(f"[{metric_name}] 未找到足够的 Fold 预测文件，跳过 Ensemble")
 
 
 def main():
