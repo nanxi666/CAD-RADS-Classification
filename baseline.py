@@ -350,7 +350,6 @@ class DabangDataset(Dataset):
         self.image_root = image_root
         self.num_views = num_views
         self.is_test = is_test
-        self.img_size = img_size
         self.vessel_map = {
             'LAD': 1,
             'LCX': 2,
@@ -363,8 +362,7 @@ class DabangDataset(Dataset):
         # 训练集增强策略
         if augment:
             self.transform = A.Compose([
-                A.RandomResizedCrop(size=(img_size, img_size),
-                                    scale=(0.9, 1.0), ratio=(0.95, 1.05), p=1.0),
+                A.Resize(height=img_size, width=img_size),
                 # 几何变换
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
@@ -464,7 +462,7 @@ class DabangDataset(Dataset):
                 tensors.append(t)
             except Exception:
                 # 异常容错: 返回全零张量
-                tensors.append(torch.zeros((3, self.img_size, self.img_size)))
+                tensors.append(torch.zeros((3, 224, 224)))
 
         # 堆叠视图 -> [Num_Views, 3, H, W]
         x = torch.stack(tensors, dim=0)
@@ -509,8 +507,7 @@ class SiameseModel(nn.Module):
     """
 
     def __init__(self, model_name: str, num_classes: int, num_views: int,
-                 use_cls_token: bool = False, use_vessel_code: bool = False, vessel_emb_dim: int = 16,
-                 drop_path_rate: float = 0.1):
+                 use_cls_token: bool = False, use_vessel_code: bool = False, vessel_emb_dim: int = 16):
         super().__init__()
         self.num_views = num_views
         self.use_cls_token = use_cls_token
@@ -524,7 +521,7 @@ class SiameseModel(nn.Module):
             pretrained=True,
             num_classes=0,
             in_chans=3,
-            drop_path_rate=drop_path_rate
+            drop_path_rate=0
         )
 
         # 获取 Backbone 输出特征维度
@@ -689,8 +686,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 
 def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0,
-                grad_accum_steps: int = 1, ema_model=None, swa_model=None, swa_start: int = 0, epoch: int = 0,
-                clip_grad: float = 0.0):
+                grad_accum_steps: int = 1, ema_model=None, swa_model=None, swa_start: int = 0, epoch: int = 0):
     """单轮训练逻辑，支持 MixUp"""
     model.train()
     if TPU_AVAILABLE and device.type == 'xla':
@@ -739,9 +735,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
-                if clip_grad and clip_grad > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), clip_grad)
                 xm.optimizer_step(optimizer, barrier=True)
                 xm.mark_step()
                 _update_ema_swa()
@@ -762,10 +755,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                         loss = criterion(outputs, y)
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
-                    if clip_grad and clip_grad > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), clip_grad)
                     scaler.step(optimizer)
                     scaler.update()
                     _update_ema_swa()
@@ -778,9 +767,6 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     loss = criterion(outputs, y)
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
-                    if clip_grad and clip_grad > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), clip_grad)
                     optimizer.step()
                     _update_ema_swa()
                     optimizer.zero_grad()
@@ -808,22 +794,15 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     if TPU_AVAILABLE and (len(loader) % grad_accum_steps != 0):
-        if clip_grad and clip_grad > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         xm.optimizer_step(optimizer, barrier=True)
         xm.mark_step()
         _update_ema_swa()
         optimizer.zero_grad()
     elif (not TPU_AVAILABLE) and (len(loader) % grad_accum_steps != 0):
         if scaler is not None:
-            if clip_grad and clip_grad > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             scaler.step(optimizer)
             scaler.update()
         else:
-            if clip_grad and clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             optimizer.step()
         _update_ema_swa()
         optimizer.zero_grad()
@@ -968,25 +947,7 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
     if (not TPU_AVAILABLE) or (xr.global_ordinal() == 0):
         print(f"\n正在加载模型进行预测: {model_path}")
 
-    def _clean_state_dict(state_dict):
-        if not isinstance(state_dict, dict):
-            return state_dict
-        if 'state_dict' in state_dict and isinstance(state_dict['state_dict'], dict):
-            state_dict = state_dict['state_dict']
-
-        cleaned = {}
-        for k, v in state_dict.items():
-            if k == 'n_averaged':
-                continue
-            new_key = k
-            if new_key.startswith('module.'):
-                new_key = new_key[len('module.'):]
-            cleaned[new_key] = v
-        return cleaned
-
-    ckpt = torch.load(model_path, map_location='cpu')
-    ckpt = _clean_state_dict(ckpt)
-    model.load_state_dict(ckpt, strict=True)
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.to(device)
     model.eval()
 
@@ -1075,24 +1036,17 @@ def parse_args():
                         help='模型架构名称 (支持 timm)')
     parser.add_argument('--num_classes', type=int, default=6, help='分类类别数')
     parser.add_argument('--num_views', type=int, default=8, help='每个样本的视图数量')
-    parser.add_argument('--img_size', type=int, default=224, help='输入图像大小')
     parser.add_argument('--use_cls_token', action='store_true',
                         help='Transformer 融合时使用 CLS token 池化')
     parser.add_argument('--use_vessel_code', action='store_true',
                         help='使用 vessel_code 条件向量')
     parser.add_argument('--vessel_emb_dim', type=int, default=16,
                         help='vessel_code 嵌入维度')
-    parser.add_argument('--drop_path_rate', type=float, default=0.1,
-                        help='Backbone 随机深度 (stochastic depth) 比例')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=256, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='初始学习率')
-    parser.add_argument('--weight_decay', type=float,
-                        default=1e-4, help='AdamW 权重衰减')
-    parser.add_argument('--clip_grad', type=float,
-                        default=1.0, help='梯度裁剪阈值 (0 关闭)')
     parser.add_argument('--label_smoothing', type=float,
                         default=0.1, help='Label smoothing 系数')
     parser.add_argument('--focal_gamma', type=float,
@@ -1183,13 +1137,13 @@ def run_worker(rank, args):
         args.test_img_root) else args.img_root
 
     train_ds = DabangDataset(train_df, args.img_root,
-                             num_views=args.num_views, augment=True, img_size=args.img_size)
+                             num_views=args.num_views, augment=True)
     val_ds = DabangDataset(val_df, args.img_root,
-                           num_views=args.num_views, augment=False, img_size=args.img_size)
+                           num_views=args.num_views, augment=False)
 
     if not test_df.empty:
         test_ds = DabangDataset(
-            test_df, test_root, num_views=args.num_views, is_test=True, img_size=args.img_size)
+            test_df, test_root, num_views=args.num_views, is_test=True)
     else:
         test_ds = None
 
@@ -1247,8 +1201,7 @@ def run_worker(rank, args):
                          num_classes=args.num_classes, num_views=args.num_views,
                          use_cls_token=args.use_cls_token,
                          use_vessel_code=args.use_vessel_code,
-                         vessel_emb_dim=args.vessel_emb_dim,
-                         drop_path_rate=args.drop_path_rate)
+                         vessel_emb_dim=args.vessel_emb_dim)
 
     model = try_enable_sync_batchnorm(
         model, is_tpu=is_tpu, is_master=is_master)
@@ -1264,8 +1217,7 @@ def run_worker(rank, args):
     model.to(device)
 
     effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
-    optimizer = optim.AdamW(
-        model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
+    optimizer = optim.Adam(model.parameters(), lr=effective_lr)
 
     if args.use_class_weights:
         class_weights = compute_class_weights_from_df(
@@ -1392,8 +1344,7 @@ def run_worker(rank, args):
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, scaler,
             mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
-            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch,
-            clip_grad=args.clip_grad)
+            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
 
         if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
             swa_scheduler.step()
