@@ -766,8 +766,10 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
                 loss_cls = mixup_criterion(criterion, logits, y_a, y_b, lam)
 
-                # Mixup 状态下禁用回归损失，避免 Target 不匹配导致的梯度干扰
-                loss = loss_cls
+                # Mixup 状态下禁用回归损失，但保留计算图连接 (乘 0.0)
+                # 这能避免 XLA 环境下因参数未参与计算导致的 "buffer deleted" 或梯度同步错误
+                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+                loss = loss_cls + 0.0 * loss_reg
             else:
                 logits, pct_pred = model(x, vessel_idx)
                 loss_cls = criterion(logits, y)
@@ -795,7 +797,9 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                         loss_cls = mixup_criterion(
                             criterion, logits, y_a, y_b, lam)
                         # Mixup 下禁用回归 Loss
-                        loss = loss_cls
+                        loss_reg = reg_criterion(
+                            pct_pred.view(-1), pct.view(-1))
+                        loss = loss_cls + 0.0 * loss_reg
                     else:
                         loss_cls = criterion(logits, y)
                         loss_reg = reg_criterion(
@@ -816,7 +820,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     loss_cls = mixup_criterion(
                         criterion, logits, y_a, y_b, lam)
                     # Mixup 下禁用回归 Loss
-                    loss = loss_cls
+                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+                    loss = loss_cls + 0.0 * loss_reg
                 else:
                     loss_cls = criterion(logits, y)
                     loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
