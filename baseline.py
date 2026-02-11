@@ -417,13 +417,30 @@ class DabangDataset(Dataset):
 
             # 1. 标签处理
             label = -1
+            pct = 0.0
             if not self.is_test:
                 # 优先直接使用分类标签，缺失时通过百分比转换
                 if pd.notna(row.get('stenosis_class')):
                     label = int(row['stenosis_class'])
-                else:
-                    pct = row.get('stenosis_percentage', 0)
-                    label = pct_to_class_6(float(pct))
+
+                # 获取百分比用于回归
+                try:
+                    pct_raw = row.get('stenosis_percentage', 0.0)
+                    if pd.isna(pct_raw):
+                        pct = 0.0
+                    else:
+                        pct = float(pct_raw)
+                except (ValueError, TypeError):
+                    pct = 0.0
+
+                if label == -1:  # 如果上面没拿到class，尝试从pct转换
+                    # 注意：get() 可能获取到 None 或 NaN
+                    stenosis_val = row.get('stenosis_percentage')
+                    if pd.notna(stenosis_val):
+                        # 这里复用上面 robust parse 得到的 pct
+                        label = pct_to_class_6(pct)
+                    else:
+                        label = 0
 
             # 2. 图像查找
             img_files = find_multiview_images(self.image_root, rid)
@@ -442,7 +459,7 @@ class DabangDataset(Dataset):
             pid = str(row.get('pid', rid)).strip()
             vessel_code = str(row.get('vessel_code', '')).upper().strip()
             vessel_idx = self.vessel_map.get(vessel_code, 0)
-            samples.append((paths, label, vessel_idx, rid, pid))
+            samples.append((paths, label, vessel_idx, rid, pid, pct))
 
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"索引构建完成，有效样本数: {len(samples)}")
@@ -452,7 +469,7 @@ class DabangDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, label, vessel_idx, rid, pid = self.samples[idx]
+        paths, label, vessel_idx, rid, pid, pct = self.samples[idx]
         tensors = []
 
         for p in paths:
@@ -472,7 +489,11 @@ class DabangDataset(Dataset):
 
         # 堆叠视图 -> [Num_Views, 3, H, W]
         x = torch.stack(tensors, dim=0)
-        return x, label, vessel_idx, rid, pid
+
+        # 将 pct 归一化到 0-1 之间
+        pct_norm = pct / 100.0
+
+        return x, label, vessel_idx, rid, pid, torch.tensor(pct_norm, dtype=torch.float32)
 
 # -------------------------------------------------------------------------
 # 模型定义
@@ -484,6 +505,7 @@ class BaselineModel(nn.Module):
     比赛 Baseline 模型。
     直接使用 Timm 库创建模型，并修改输入通道数以支持多视图堆叠输入。
     不使用预训练权重，进行全量训练。
+    注意：此模型暂不支持回归头输出，仅保留用于兼容性测试。
     """
 
     def __init__(self, model_name: str, num_classes: int, num_views: int):
@@ -500,8 +522,11 @@ class BaselineModel(nn.Module):
             in_chans=in_chans
         )
 
-    def forward(self, x):
-        return self.backbone(x)
+    def forward(self, x, vessel_idx=None):
+        out = self.backbone(x)
+        # 保持与 SiameseModel 一致的接口：(logits, reg_out)
+        # 这里 reg_out 返回 None，训练循环中会处理这种情况
+        return out, None
 
 
 class SiameseModel(nn.Module):
@@ -582,6 +607,16 @@ class SiameseModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
+        # 5. 回归头 (输出0-1之间的百分比)
+        self.regressor = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
     def forward(self, x, vessel_idx=None):
         # x shape: [Batch, Views, 3, H, W]
         b, v, c, h, w = x.shape
@@ -620,9 +655,11 @@ class SiameseModel(nn.Module):
         else:
             pooled = fused.mean(dim=1)
 
-        # 6. 分类
-        out = self.classifier(pooled)
-        return out
+        # 6. 分类与回归
+        class_logits = self.classifier(pooled)
+        reg_out = self.regressor(pooled)
+
+        return class_logits, reg_out
 
 # -------------------------------------------------------------------------
 # 训练与验证流程
@@ -689,7 +726,7 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
 
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+    return mixed_x, y_a, y_b, lam, index
 
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
@@ -705,6 +742,9 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
     running_loss = 0.0
     correct = 0
     total = 0
+
+    # 辅助 Loss
+    reg_criterion = nn.MSELoss()
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
@@ -729,20 +769,51 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if (swa_model is not None) and (epoch >= swa_start):
             swa_model.update_parameters(model)
 
-    for step, (x, y, vessel_idx, _, _) in enumerate(iter_loader):
-        x, y = x.to(device), y.to(device)
+    def compute_loss(outs, target_y, target_pct, lam_val=None, idx_val=None):
+        # 解包
+        if isinstance(outs, tuple):
+            logits, reg_out = outs
+            reg_out = reg_out.view(-1)
+        else:
+            logits = outs
+            reg_out = None
+
+        # Classification Loss
+        if lam_val is not None:
+            loss_cls = mixup_criterion(
+                criterion, logits, target_y, target_y[idx_val], lam_val)
+        else:
+            loss_cls = criterion(logits, target_y)
+
+        # Regression Loss
+        loss_reg = torch.tensor(0.0, device=device)
+        if reg_out is not None:
+            if lam_val is not None:
+                # Mix regression targets
+                loss_reg = lam_val * reg_criterion(reg_out, target_pct) + \
+                    (1 - lam_val) * reg_criterion(reg_out, target_pct[idx_val])
+            else:
+                loss_reg = reg_criterion(reg_out, target_pct)
+
+        # Combine
+        total_loss = loss_cls + 10.0 * loss_reg
+
+        return total_loss, logits
+
+    for step, (x, y, vessel_idx, _, _, pct) in enumerate(iter_loader):
+        x, y, pct = x.to(device), y.to(device), pct.to(device)
 
         # Mixup处理
         use_mixup = (mixup_alpha > 0)
 
         if TPU_AVAILABLE:
             if use_mixup:
-                x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
+                x, y_a, y_b, lam, idx = mixup_data(x, y, mixup_alpha, device)
                 outputs = model(x, vessel_idx)
-                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+                loss, logits = compute_loss(outputs, y, pct, lam, idx)
             else:
                 outputs = model(x, vessel_idx)
-                loss = criterion(outputs, y)
+                loss, logits = compute_loss(outputs, y, pct)
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -752,18 +823,14 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                 optimizer.zero_grad()
         else:
             if use_mixup:
-                x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
+                x, y_a, y_b, lam, idx = mixup_data(x, y, mixup_alpha, device)
             else:
-                y_a, y_b, lam = None, None, None
+                y_a, y_b, lam, idx = None, None, None, None
 
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     outputs = model(x, vessel_idx)
-                    if use_mixup:
-                        loss = mixup_criterion(
-                            criterion, outputs, y_a, y_b, lam)
-                    else:
-                        loss = criterion(outputs, y)
+                    loss, logits = compute_loss(outputs, y, pct, lam, idx)
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
@@ -772,10 +839,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     optimizer.zero_grad()
             else:
                 outputs = model(x, vessel_idx)
-                if use_mixup:
-                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-                else:
-                    loss = criterion(outputs, y)
+                loss, logits = compute_loss(outputs, y, pct, lam, idx)
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     optimizer.step()
@@ -785,7 +849,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # 统计指标
         with torch.no_grad():
             running_loss += loss.item()
-            _, predicted = outputs.max(1)
+            _, predicted = logits.max(1)  # Use logits from compute_loss
             total += y.size(0)
 
             if use_mixup:
@@ -857,8 +921,13 @@ def validate(model, loader, device, criterion, num_classes=6):
     """验证集评估逻辑 (支持TPU多核Reduce)"""
     model.eval()
     running_loss = 0.0
+    running_mae = 0.0  # Regression MAE
     confusion_matrix = torch.zeros(
         (num_classes, num_classes), dtype=torch.long, device=device)
+
+    # Regression Loss Criterion
+    reg_criterion = nn.MSELoss()
+    mae_criterion = nn.L1Loss()  # For metric
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
@@ -871,14 +940,34 @@ def validate(model, loader, device, criterion, num_classes=6):
                        leave=False) if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, y, vessel_idx, _, _ in iter_loader:
-            x, y = x.to(device), y.to(device)
+        for x, y, vessel_idx, _, _, pct in iter_loader:
+            x, y, pct = x.to(device), y.to(device), pct.to(device)
             outputs = model(x, vessel_idx)
-            loss = criterion(outputs, y)
 
-            running_loss += loss.item()
+            if isinstance(outputs, tuple):
+                logits, reg_out = outputs
+                reg_out = reg_out.view(-1)
+            else:
+                logits = outputs
+                reg_out = None
 
-            _, preds = outputs.max(1)
+            # Loss calculation
+            loss_cls = criterion(logits, y)
+
+            loss_reg = torch.tensor(0.0, device=device)
+            mae = torch.tensor(0.0, device=device)
+            if reg_out is not None:
+                loss_reg = reg_criterion(reg_out, pct)
+                # Convert back to percentage
+                mae = mae_criterion(reg_out, pct) * 100.0
+
+            # Combine loss
+            loss = loss_cls + 10.0 * loss_reg
+
+            running_loss += loss.item()  # total loss
+            running_mae += mae.item()
+
+            _, preds = logits.max(1)
             indices = y * num_classes + preds
             batch_conf_mat = torch.bincount(indices, minlength=num_classes**2)
             confusion_matrix += batch_conf_mat.view(num_classes, num_classes)
@@ -886,20 +975,33 @@ def validate(model, loader, device, criterion, num_classes=6):
     if TPU_AVAILABLE:
         if not isinstance(running_loss, torch.Tensor):
             running_loss = torch.tensor(running_loss, device=device)
+        if not isinstance(running_mae, torch.Tensor):
+            running_mae = torch.tensor(running_mae, device=device)
 
-        t_metrics = [running_loss, confusion_matrix]
+        t_metrics = [running_loss, confusion_matrix, running_mae]
         xm.all_reduce('sum', t_metrics)
 
         global_loss_sum = t_metrics[0].item()
         global_conf_mat = t_metrics[1].cpu().numpy()
+        global_mae_sum = t_metrics[2].item()
 
-        total_batches = len(loader) * xr.world_size()
-        avg_loss = global_loss_sum / \
-            (total_batches if total_batches > 0 else 1)
+        # NOTE: len(loader) returns total length / world_size if using DistributedSampler?
+        # ParallelLoader usually iterates over local subset.
+        # Just use total_batches = len(loader) calculation from before
+        total_batches = len(loader) * xr.world_size()  # Approximately
+
+        denom = total_batches if total_batches > 0 else 1
+        avg_loss = global_loss_sum / denom
+        avg_mae = global_mae_sum / denom
 
     else:
         avg_loss = running_loss / len(loader)
+        avg_mae = running_mae / len(loader)
         global_conf_mat = confusion_matrix.cpu().numpy()
+
+    # Return everything needed
+    return avg_loss, global_conf_mat, avg_mae
+    global_conf_mat = confusion_matrix.cpu().numpy()
 
     tp_sum = np.trace(global_conf_mat)
     total_samples = np.sum(global_conf_mat)
@@ -986,16 +1088,27 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
         loader_wrapper, desc=f"Inference ({output_name})") if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, _, vessel_idx, rids, pids in iter_loader:
+        for x, _, vessel_idx, rids, pids, _ in iter_loader:
             x = x.to(device)
             outputs = model(x, vessel_idx)
 
+            if isinstance(outputs, tuple):
+                logits, _ = outputs
+            else:
+                logits = outputs
+
             x_flip = torch.flip(x, dims=[-1])
             outputs_flip = model(x_flip, vessel_idx)
-            outputs = (outputs + outputs_flip) / 2
 
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            preds = outputs.argmax(1).cpu().numpy()
+            if isinstance(outputs_flip, tuple):
+                logits_flip, _ = outputs_flip
+            else:
+                logits_flip = outputs_flip
+
+            logits = (logits + logits_flip) / 2
+
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds = logits.argmax(1).cpu().numpy()
 
             for rid, pid, pred, prob in zip(rids, pids, preds, probs):
                 row = {'ID': rid, 'Prediction': pred}
@@ -1364,13 +1477,18 @@ def run_worker(rank, args):
         optimizer.zero_grad()
         for _ in range(args.warmup_steps):
             try:
-                x, y, vessel_idx, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _, pct = next(warmup_iter)
             except StopIteration:
                 warmup_iter = iter(loader_wrapper)
-                x, y, vessel_idx, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _, pct = next(warmup_iter)
             x, y = x.to(device), y.to(device)
+            # Warmup: Ignore regression
             outputs = model(x, vessel_idx)
-            loss = criterion(outputs, y)
+            if isinstance(outputs, tuple):
+                logits, _ = outputs
+            else:
+                logits = outputs
+            loss = criterion(logits, y)
             loss.backward()
             if TPU_AVAILABLE and device.type == 'xla':
                 xm.optimizer_step(optimizer, barrier=True)
@@ -1399,8 +1517,26 @@ def run_worker(rank, args):
         current_lr = scheduler.get_last_lr()[0]
 
         eval_model = ema_model if (ema_model is not None) else model
-        val_metrics = validate(eval_model, val_loader, device,
-                               criterion, num_classes=args.num_classes)
+        val_loss, val_cm, val_mae = validate(eval_model, val_loader, device,
+                                             criterion, num_classes=args.num_classes)
+
+        # Calculate Metrics from CM
+        tp = np.diag(val_cm)
+        total_samples = val_cm.sum()
+        val_acc = tp.sum() / total_samples if total_samples > 0 else 0
+
+        # Macro F1
+        recall = tp / (val_cm.sum(axis=1) + 1e-8)
+        precision = tp / (val_cm.sum(axis=0) + 1e-8)
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+        val_f1 = np.mean(f1_scores)
+
+        val_metrics = {
+            'loss': val_loss,
+            'acc': val_acc,
+            'f1': val_f1,
+            'mae': val_mae
+        }
 
         dt = time.time() - t0
 
@@ -1408,7 +1544,7 @@ def run_worker(rank, args):
             log_msg = (
                 f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
                 f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
-                f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
+                f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f} MAE={val_metrics['mae']:.2f}"
             )
             print(log_msg)
             if logger is not None:
