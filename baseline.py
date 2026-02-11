@@ -766,21 +766,14 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
                 loss_cls = mixup_criterion(criterion, logits, y_a, y_b, lam)
 
-                # 回归 Loss 暂不 Mixup，直接计算(需改进)或忽略
-                # 简单起见，对回归 Loss 应用同样的 mixup 权重
-                # 注意：这里我们无法获得 shuffle index，所以无法 mixup 回归 target
-                # 因此：如果开启 Mixup，我们暂时只对分类做 Mixup Loss，回归 Loss 仍用原始 Target (可能产生冲突，但权重大)
-                # 或者：为了稳定，如果 Mixup 开启, 回归 Loss 权重设为 0? 不行。
-                # 最佳方案：Mixup 时禁用 Regression loss? 或者只做分类。
-                # 折中：计算原始 Regression Loss
-                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-
-                loss = loss_cls + 10.0 * loss_reg
+                # Mixup 状态下禁用回归损失，避免 Target 不匹配导致的梯度干扰
+                loss = loss_cls
             else:
                 logits, pct_pred = model(x, vessel_idx)
                 loss_cls = criterion(logits, y)
                 loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                loss = loss_cls + 10.0 * loss_reg
+                # 降低回归损失权重 (10.0 -> 0.1) 以防止干扰主分类任务
+                loss = loss_cls + 0.1 * loss_reg
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -801,12 +794,14 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     if use_mixup:
                         loss_cls = mixup_criterion(
                             criterion, logits, y_a, y_b, lam)
+                        # Mixup 下禁用回归 Loss
+                        loss = loss_cls
                     else:
                         loss_cls = criterion(logits, y)
-
-                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-
-                    loss = loss_cls + 10.0 * loss_reg
+                        loss_reg = reg_criterion(
+                            pct_pred.view(-1), pct.view(-1))
+                        # 降低回归权重 10.0 -> 0.1
+                        loss = loss_cls + 0.1 * loss_reg
 
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
@@ -820,11 +815,13 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                 if use_mixup:
                     loss_cls = mixup_criterion(
                         criterion, logits, y_a, y_b, lam)
+                    # Mixup 下禁用回归 Loss
+                    loss = loss_cls
                 else:
                     loss_cls = criterion(logits, y)
-
-                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                loss = loss_cls + 10.0 * loss_reg
+                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
+                    # 降低回归权重 10.0 -> 0.1
+                    loss = loss_cls + 0.1 * loss_reg
 
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
@@ -928,7 +925,7 @@ def validate(model, loader, device, criterion, num_classes=6):
         for x, y, vessel_idx, _, _, pct in iter_loader:
             x, y, pct = x.to(device), y.to(device), pct.to(device)
             logits, pct_pred = model(x, vessel_idx)
-            loss = criterion(logits, y) + 10.0 * \
+            loss = criterion(logits, y) + 0.1 * \
                 nn.MSELoss()(pct_pred.view(-1), pct.view(-1))
 
             running_loss += loss.item()
@@ -1023,7 +1020,12 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
             new_state_dict[k[7:]] = v
         else:
             new_state_dict[k] = v
-    model.load_state_dict(new_state_dict)
+
+    # 兼容 DataParallel 包装: 如果模型被 wrapper 包装，加载到 module 中
+    if hasattr(model, 'module'):
+        model.module.load_state_dict(new_state_dict)
+    else:
+        model.load_state_dict(new_state_dict)
 
     model.to(device)
     model.eval()
@@ -1041,7 +1043,8 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
         loader_wrapper, desc=f"Inference ({output_name})") if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, _, vessel_idx, rids, pids in iter_loader:
+        # 修正: Dataset 返回 6 个值 (x, label, vessel_idx, rid, pid, pct_val)
+        for x, _, vessel_idx, rids, pids, _ in iter_loader:
             x = x.to(device)
             logits, pct_pred = model(x, vessel_idx)
 
