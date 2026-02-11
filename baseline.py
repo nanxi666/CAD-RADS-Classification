@@ -19,7 +19,7 @@ from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
-from sklearn.model_selection import train_test_split, StratifiedGroupKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 import timm
@@ -417,8 +417,6 @@ class DabangDataset(Dataset):
 
             # 1. 标签处理
             label = -1
-            pct_val = 0.0  # 默认百分比
-
             if not self.is_test:
                 # 优先直接使用分类标签，缺失时通过百分比转换
                 if pd.notna(row.get('stenosis_class')):
@@ -426,12 +424,6 @@ class DabangDataset(Dataset):
                 else:
                     pct = row.get('stenosis_percentage', 0)
                     label = pct_to_class_6(float(pct))
-
-                # 获取百分比 (归一化到 0-1) 用于回归
-                raw_pct = row.get('stenosis_percentage', 0.0)
-                if pd.isna(raw_pct):
-                    raw_pct = 0.0
-                pct_val = float(raw_pct) / 100.0
 
             # 2. 图像查找
             img_files = find_multiview_images(self.image_root, rid)
@@ -450,7 +442,7 @@ class DabangDataset(Dataset):
             pid = str(row.get('pid', rid)).strip()
             vessel_code = str(row.get('vessel_code', '')).upper().strip()
             vessel_idx = self.vessel_map.get(vessel_code, 0)
-            samples.append((paths, label, vessel_idx, rid, pid, pct_val))
+            samples.append((paths, label, vessel_idx, rid, pid))
 
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"索引构建完成，有效样本数: {len(samples)}")
@@ -460,7 +452,7 @@ class DabangDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, label, vessel_idx, rid, pid, pct_val = self.samples[idx]
+        paths, label, vessel_idx, rid, pid = self.samples[idx]
         tensors = []
 
         for p in paths:
@@ -480,7 +472,7 @@ class DabangDataset(Dataset):
 
         # 堆叠视图 -> [Num_Views, 3, H, W]
         x = torch.stack(tensors, dim=0)
-        return x, label, vessel_idx, rid, pid, torch.tensor(pct_val, dtype=torch.float32)
+        return x, label, vessel_idx, rid, pid
 
 # -------------------------------------------------------------------------
 # 模型定义
@@ -590,15 +582,6 @@ class SiameseModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
-        # 5. 回归头 (Sigmoid -> 0-1)
-        self.regressor = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(in_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 1),
-            nn.Sigmoid()
-        )
-
     def forward(self, x, vessel_idx=None):
         # x shape: [Batch, Views, 3, H, W]
         b, v, c, h, w = x.shape
@@ -638,12 +621,8 @@ class SiameseModel(nn.Module):
             pooled = fused.mean(dim=1)
 
         # 6. 分类
-        logits = self.classifier(pooled)
-
-        # 7. 回归
-        pct_pred = self.regressor(pooled)
-
-        return logits, pct_pred
+        out = self.classifier(pooled)
+        return out
 
 # -------------------------------------------------------------------------
 # 训练与验证流程
@@ -750,32 +729,20 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if (swa_model is not None) and (epoch >= swa_start):
             swa_model.update_parameters(model)
 
-    for step, (x, y, vessel_idx, _, _, pct) in enumerate(iter_loader):
-        x, y, pct = x.to(device), y.to(device), pct.to(device)
+    for step, (x, y, vessel_idx, _, _) in enumerate(iter_loader):
+        x, y = x.to(device), y.to(device)
 
         # Mixup处理
         use_mixup = (mixup_alpha > 0)
 
-        reg_criterion = nn.MSELoss()
-
         if TPU_AVAILABLE:
             if use_mixup:
-                # Mixup for classification labels
                 x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha, device)
-                logits, pct_pred = model(x, vessel_idx)
-
-                loss_cls = mixup_criterion(criterion, logits, y_a, y_b, lam)
-
-                # Mixup 状态下禁用回归损失，但保留计算图连接 (乘 0.0)
-                # 这能避免 XLA 环境下因参数未参与计算导致的 "buffer deleted" 或梯度同步错误
-                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                loss = loss_cls + 0.0 * loss_reg
+                outputs = model(x, vessel_idx)
+                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
             else:
-                logits, pct_pred = model(x, vessel_idx)
-                loss_cls = criterion(logits, y)
-                loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                # 降低回归损失权重 (10.0 -> 0.1) 以防止干扰主分类任务
-                loss = loss_cls + 0.1 * loss_reg
+                outputs = model(x, vessel_idx)
+                loss = criterion(outputs, y)
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -791,22 +758,12 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
 
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    logits, pct_pred = model(x, vessel_idx)
-
+                    outputs = model(x, vessel_idx)
                     if use_mixup:
-                        loss_cls = mixup_criterion(
-                            criterion, logits, y_a, y_b, lam)
-                        # Mixup 下禁用回归 Loss
-                        loss_reg = reg_criterion(
-                            pct_pred.view(-1), pct.view(-1))
-                        loss = loss_cls + 0.0 * loss_reg
+                        loss = mixup_criterion(
+                            criterion, outputs, y_a, y_b, lam)
                     else:
-                        loss_cls = criterion(logits, y)
-                        loss_reg = reg_criterion(
-                            pct_pred.view(-1), pct.view(-1))
-                        # 降低回归权重 10.0 -> 0.1
-                        loss = loss_cls + 0.1 * loss_reg
-
+                        loss = criterion(outputs, y)
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
@@ -814,20 +771,11 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     _update_ema_swa()
                     optimizer.zero_grad()
             else:
-                logits, pct_pred = model(x, vessel_idx)
-
+                outputs = model(x, vessel_idx)
                 if use_mixup:
-                    loss_cls = mixup_criterion(
-                        criterion, logits, y_a, y_b, lam)
-                    # Mixup 下禁用回归 Loss
-                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                    loss = loss_cls + 0.0 * loss_reg
+                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
                 else:
-                    loss_cls = criterion(logits, y)
-                    loss_reg = reg_criterion(pct_pred.view(-1), pct.view(-1))
-                    # 降低回归权重 10.0 -> 0.1
-                    loss = loss_cls + 0.1 * loss_reg
-
+                    loss = criterion(outputs, y)
                 (loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     optimizer.step()
@@ -837,7 +785,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # 统计指标
         with torch.no_grad():
             running_loss += loss.item()
-            _, predicted = logits.max(1)
+            _, predicted = outputs.max(1)
             total += y.size(0)
 
             if use_mixup:
@@ -900,11 +848,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         # 如果追求精确，应该记录 loss * batch_size 然后 all_reduce sum
 
         total_steps = len(loader)  # per core
-
-        # 修正 TPU Loss 统计：running_loss 是所有核 sum 起来的，需要除以 world_size
-        avg_loss = running_loss / (total_steps * xr.world_size())
-
-        return avg_loss, correct / (total_sum if total_sum > 0 else 1)
+        return running_loss / total_steps, correct / (total_sum if total_sum > 0 else 1)
 
     return running_loss / len(loader), correct / total
 
@@ -927,15 +871,14 @@ def validate(model, loader, device, criterion, num_classes=6):
                        leave=False) if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, y, vessel_idx, _, _, pct in iter_loader:
-            x, y, pct = x.to(device), y.to(device), pct.to(device)
-            logits, pct_pred = model(x, vessel_idx)
-            loss = criterion(logits, y) + 0.1 * \
-                nn.MSELoss()(pct_pred.view(-1), pct.view(-1))
+        for x, y, vessel_idx, _, _ in iter_loader:
+            x, y = x.to(device), y.to(device)
+            outputs = model(x, vessel_idx)
+            loss = criterion(outputs, y)
 
             running_loss += loss.item()
 
-            _, preds = logits.max(1)
+            _, preds = outputs.max(1)
             indices = y * num_classes + preds
             batch_conf_mat = torch.bincount(indices, minlength=num_classes**2)
             confusion_matrix += batch_conf_mat.view(num_classes, num_classes)
@@ -1025,12 +968,7 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
             new_state_dict[k[7:]] = v
         else:
             new_state_dict[k] = v
-
-    # 兼容 DataParallel 包装: 如果模型被 wrapper 包装，加载到 module 中
-    if hasattr(model, 'module'):
-        model.module.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict)
 
     model.to(device)
     model.eval()
@@ -1048,23 +986,19 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
         loader_wrapper, desc=f"Inference ({output_name})") if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        # 修正: Dataset 返回 6 个值 (x, label, vessel_idx, rid, pid, pct_val)
-        for x, _, vessel_idx, rids, pids, _ in iter_loader:
+        for x, _, vessel_idx, rids, pids in iter_loader:
             x = x.to(device)
-            logits, pct_pred = model(x, vessel_idx)
+            outputs = model(x, vessel_idx)
 
             x_flip = torch.flip(x, dims=[-1])
-            logits_flip, pct_flip = model(x_flip, vessel_idx)
+            outputs_flip = model(x_flip, vessel_idx)
+            outputs = (outputs + outputs_flip) / 2
 
-            logits = (logits + logits_flip) / 2
-            pct_final = (pct_pred + pct_flip) / 2
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()
+            preds = outputs.argmax(1).cpu().numpy()
 
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-            preds = logits.argmax(1).cpu().numpy()
-            pcts = pct_final.cpu().numpy().flatten()
-
-            for rid, pid, pred, prob, reg_val in zip(rids, pids, preds, probs, pcts):
-                row = {'ID': rid, 'Prediction': pred, 'reg_pct': reg_val}
+            for rid, pid, pred, prob in zip(rids, pids, preds, probs):
+                row = {'ID': rid, 'Prediction': pred}
                 for i, p in enumerate(prob):
                     row[f'prob_{i}'] = p
                 results.append(row)
@@ -1177,11 +1111,6 @@ def parse_args():
     parser.add_argument('--warmup_steps', type=int, default=1,
                         help='训练前 warmup 步数（用于摊薄 TPU 首轮编译成本）')
 
-    # K-Fold 参数
-    parser.add_argument('--n_folds', type=int, default=5, help='K-Fold 交叉验证折数')
-    parser.add_argument('--selected_fold', type=int, default=-1,
-                        help='仅运行特定折 (-1 表示运行所有折)')
-
     # Jupyter kernel 兼容参数
     parser.add_argument('-f', '--file', type=str,
                         required=False, help='Jupyter kernel file (ignore)')
@@ -1242,380 +1171,315 @@ def run_worker(rank, args):
                 r'\d+', x)[0] if re.findall(r'\d+', x) else x)
 
     pids = train_val_df['pid'].unique()
+    train_pids, val_pids = train_test_split(
+        pids, test_size=0.15, random_state=args.seed)
+    train_df = train_val_df[train_val_df['pid'].isin(train_pids)].copy()
+    val_df = train_val_df[train_val_df['pid'].isin(val_pids)].copy()
 
-    # K-Fold 分层逻辑
-    if 'stenosis_class' not in train_val_df.columns:
-        train_val_df['stenosis_class'] = train_val_df['stenosis_percentage'].apply(
-            lambda p: pct_to_class_6(float(p)))
-    train_val_df['stratify_label'] = train_val_df['stenosis_class'].fillna(
-        0).astype(int)
+    test_root = args.test_img_root if os.path.exists(
+        args.test_img_root) else args.img_root
 
-    skf = StratifiedGroupKFold(
-        n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    train_ds = DabangDataset(train_df, args.img_root,
+                             num_views=args.num_views, augment=True)
+    val_ds = DabangDataset(val_df, args.img_root,
+                           num_views=args.num_views, augment=False)
 
-    # 打印 K-Fold 信息
-    if is_master:
-        print(f"启动 {args.n_folds} 折交叉验证...")
+    if not test_df.empty:
+        test_ds = DabangDataset(
+            test_df, test_root, num_views=args.num_views, is_test=True)
+    else:
+        test_ds = None
 
-    # 对全量 train/val 数据进行划分
-    fold_generator = list(skf.split(
-        train_val_df, train_val_df['stratify_label'], groups=train_val_df['pid']))
-
-    for fold_idx, (train_idx, val_idx) in enumerate(fold_generator):
-        if args.selected_fold != -1 and fold_idx != args.selected_fold:
-            continue
-
+    loader_num_workers = 0 if is_tpu else args.num_workers
+    if (not is_tpu) and os.name == "nt" and loader_num_workers > 0:
         if is_master:
-            print(f"\n{'='*30} Fold {fold_idx + 1} / {args.n_folds} {'='*30}")
-            if logger is not None:
-                logger.info(f"Starting Fold {fold_idx + 1} / {args.n_folds}")
+            print("检测到 Windows 环境，num_workers>0 可能导致 DataLoader 卡住，已自动设为 0")
+        loader_num_workers = 0
+    if is_tpu and args.tpu_batch_is_global:
+        per_core_batch = max(1, args.batch_size // xr.world_size())
+    else:
+        per_core_batch = args.batch_size
+    if is_master and is_tpu:
+        print(
+            f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
 
-        # 切分 Dataframe
-        train_df = train_val_df.iloc[train_idx].copy()
-        val_df = train_val_df.iloc[val_idx].copy()
+    loader_args = {
+        'batch_size': per_core_batch,
+        'num_workers': loader_num_workers,
+        'pin_memory': not is_tpu,
+        'drop_last': False  # 用户要求保留所有数据
+    }
+    if loader_num_workers > 0:
+        loader_args['persistent_workers'] = False
 
-        test_root = args.test_img_root if os.path.exists(
-            args.test_img_root) else args.img_root
+    if is_tpu:
+        # 用户数据量少，不想丢弃数据，因此设为 False。
+        # 注意: 这可能会导致每个 Epoch 最后一个 Batch 触发 TPU 重编译，稍微拖慢一点点末尾速度，但能保留数据。
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=False)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
 
-        train_ds = DabangDataset(train_df, args.img_root,
-                                 num_views=args.num_views, augment=True)
-        val_ds = DabangDataset(val_df, args.img_root,
-                               num_views=args.num_views, augment=False)
+        train_loader = DataLoader(
+            train_ds, sampler=train_sampler, **loader_args)
+        val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
 
-        if not test_df.empty:
-            test_ds = DabangDataset(
-                test_df, test_root, num_views=args.num_views, is_test=True)
-        else:
-            test_ds = None
-
-        loader_num_workers = 0 if is_tpu else args.num_workers
-        if (not is_tpu) and os.name == "nt" and loader_num_workers > 0:
-            if is_master:
-                print("检测到 Windows 环境，num_workers>0 可能导致 DataLoader 卡住，已自动设为 0")
-            loader_num_workers = 0
-        if is_tpu and args.tpu_batch_is_global:
-            per_core_batch = max(1, args.batch_size // xr.world_size())
-        else:
-            per_core_batch = args.batch_size
-        if is_master and is_tpu:
-            print(
-                f"TPU per-core batch: {per_core_batch} (global={per_core_batch * xr.world_size()})")
-
-        loader_args = {
-            'batch_size': per_core_batch,
-            'num_workers': loader_num_workers,
-            'pin_memory': not is_tpu,
-            'drop_last': False
-        }
-        if loader_num_workers > 0:
-            loader_args['persistent_workers'] = False
-
-        # 初始化 Loaders (每次 Fold 重新初始化)
-        if is_tpu:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(
-                train_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=True, drop_last=False)
-            val_sampler = torch.utils.data.distributed.DistributedSampler(
-                val_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
-            train_loader = DataLoader(
-                train_ds, sampler=train_sampler, **loader_args)
-            val_loader = DataLoader(val_ds, sampler=val_sampler, **loader_args)
-            if test_ds:
-                test_sampler = torch.utils.data.distributed.DistributedSampler(
-                    test_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
-                test_loader = DataLoader(
-                    test_ds, sampler=test_sampler, **loader_args)
-            else:
-                test_loader = []
-        else:
-            train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
-            val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
+        if test_ds:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_ds, num_replicas=xr.world_size(), rank=xr.global_ordinal(), shuffle=False, drop_last=False)
             test_loader = DataLoader(
-                test_ds, shuffle=False, **loader_args) if test_ds else []
-
-        # 模型初始化
-        if is_master:
-            print(f"初始化 SiameseModel ({args.model}) ...")
-
-        model = SiameseModel(model_name=args.model,
-                             num_classes=args.num_classes, num_views=args.num_views,
-                             use_cls_token=args.use_cls_token,
-                             use_vessel_code=args.use_vessel_code,
-                             vessel_emb_dim=args.vessel_emb_dim,
-                             drop_path_rate=args.drop_path_rate)
-
-        model = try_enable_sync_batchnorm(
-            model, is_tpu=is_tpu, is_master=is_master)
-        if is_tpu:
-            model = replace_batchnorm_with_groupnorm(
-                model, num_groups=16, is_master=is_master)
-
-        if (not is_tpu) and (torch.cuda.device_count() > 1):
-            if is_master:
-                print(
-                    f"检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel 并行训练")
-            model = nn.DataParallel(model)
-
-        model.to(device)
-
-        effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
-        optimizer = optim.AdamW(
-            model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
-
-        if args.use_class_weights:
-            class_weights = compute_class_weights_from_df(
-                train_df, args.num_classes).to(device)
-            if is_master:
-                print(f"已启用类别权重: {class_weights.tolist()}")
+                test_ds, sampler=test_sampler, **loader_args)
         else:
-            class_weights = None
-            if is_master:
-                print("未启用类别权重 (优化 Accuracy)")
+            test_loader = []
+    else:
+        train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
+        val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
+        test_loader = DataLoader(
+            test_ds, shuffle=False, **loader_args) if test_ds else []
 
-        if args.loss_type == 'focal':
-            criterion = FocalLoss(
-                alpha=class_weights,
-                gamma=args.focal_gamma,
-                label_smoothing=args.label_smoothing
-            )
-        else:
-            criterion = nn.CrossEntropyLoss(
-                weight=class_weights,
-                label_smoothing=args.label_smoothing
-            )
+    if is_master:
+        print(f"初始化 SiameseModel ({args.model}) ...")
 
-        scaler = torch.cuda.amp.GradScaler() if (
-            not is_tpu and torch.cuda.is_available()) else None
+    model = SiameseModel(model_name=args.model,
+                         num_classes=args.num_classes, num_views=args.num_views,
+                         use_cls_token=args.use_cls_token,
+                         use_vessel_code=args.use_vessel_code,
+                         vessel_emb_dim=args.vessel_emb_dim,
+                         drop_path_rate=args.drop_path_rate)
 
-        scheduler = build_warmup_cosine_scheduler(
-            optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs)
+    model = try_enable_sync_batchnorm(
+        model, is_tpu=is_tpu, is_master=is_master)
+    if is_tpu:
+        model = replace_batchnorm_with_groupnorm(
+            model, num_groups=16, is_master=is_master)
 
-        ema_model = None
-        if args.use_ema:
-            def _ema_avg_fn(averaged_param, param, num_averaged):
-                return averaged_param * args.ema_decay + param * (1.0 - args.ema_decay)
-            ema_model = AveragedModel(model, avg_fn=_ema_avg_fn).to(device)
-
-        swa_model = None
-        swa_scheduler = None
-        if args.use_swa:
-            swa_model = AveragedModel(model).to(device)
-            swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
-
-        def master_print(*args_p, **kwargs_p):
-            if is_master:
-                print(*args_p, **kwargs_p)
-
-        # Early Stopping Monitors with Fold Suffix
-        es_acc = EarlyStopping(
-            patience=args.patience, verbose=True,
-            path=os.path.join(
-                args.output_dir, f'best_model_fold_{fold_idx}.pt'),
-            trace_func=lambda s: master_print(f"[ES-Acc] {s}"), mode='max'
-        )
-        es_f1_monitor = EarlyStopping(
-            patience=args.patience, verbose=True,
-            path=os.path.join(
-                args.output_dir, f'best_model_f1_fold_{fold_idx}.pt'),
-            trace_func=lambda s: master_print(f"[ES-F1] {s}"), mode='max'
-        )
-        es_loss_monitor = EarlyStopping(
-            patience=args.patience, verbose=True,
-            path=os.path.join(
-                args.output_dir, f'best_model_loss_fold_{fold_idx}.pt'),
-            trace_func=lambda s: master_print(f"[ES-Loss] {s}"), mode='min'
-        )
-
-        best_acc = 0.0
-        best_loss = float('inf')
-
+    if (not is_tpu) and (torch.cuda.device_count() > 1):
         if is_master:
-            print(f"开始 Fold {fold_idx+1} 训练流程... (联合早停策略)")
-            print(f"Warmup {args.warmup_steps} step(s)...")
+            print(f"检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel 并行训练")
+        model = nn.DataParallel(model)
 
-        # Warmup
-        if args.warmup_steps > 0:
-            model.train()
-            loader_wrapper = train_loader
+    model.to(device)
+
+    # 修改：使用 AdamW 代替 Adam，并应用 weight_decay 进行正则化
+    effective_lr = args.lr * (args.tpu_lr_scale if is_tpu else 1.0)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=effective_lr, weight_decay=args.weight_decay)
+
+    if args.use_class_weights:
+        class_weights = compute_class_weights_from_df(
+            train_df, args.num_classes).to(device)
+        if is_master:
+            print(f"已启用类别权重: {class_weights.tolist()}")
+    else:
+        class_weights = None
+        if is_master:
+            print("未启用类别权重 (优化 Accuracy)")
+
+    # 选择损失函数
+    if args.loss_type == 'focal':
+        criterion = FocalLoss(
+            alpha=class_weights,
+            gamma=args.focal_gamma,
+            label_smoothing=args.label_smoothing
+        )
+        if is_master:
+            print(f"使用 FocalLoss (gamma={args.focal_gamma})")
+    else:
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+        if is_master:
+            print("使用 CrossEntropyLoss")
+
+    scaler = torch.cuda.amp.GradScaler() if (
+        not is_tpu and torch.cuda.is_available()) else None
+
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs)
+
+    ema_model = None
+    if args.use_ema:
+        def _ema_avg_fn(averaged_param, param, num_averaged):
+            return averaged_param * args.ema_decay + param * (1.0 - args.ema_decay)
+
+        ema_model = AveragedModel(model, avg_fn=_ema_avg_fn).to(device)
+
+    swa_model = None
+    swa_scheduler = None
+    if args.use_swa:
+        swa_model = AveragedModel(model).to(device)
+        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
+
+    def master_print(*args_p, **kwargs_p):
+        if is_master:
+            print(*args_p, **kwargs_p)
+
+    # ---------------------------------------------------------------------
+    # 策略修改: 同时监控 Acc, F1, Loss 三个指标
+    # 只有当三个指标都耗尽耐心(Patience)时，才触发早停。
+    # 这样可以确保模型在任何一个维度仍有进步空间时继续训练。
+    # ---------------------------------------------------------------------
+
+    # 1. Accuracy Monitor (Max)
+    es_acc = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'best_model.pt'),
+        trace_func=lambda s: master_print(f"[ES-Acc] {s}"),
+        mode='max'
+    )
+
+    # 2. F1 Monitor (Max)
+    es_f1_monitor = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'best_model_f1.pt'),
+        trace_func=lambda s: master_print(f"[ES-F1] {s}"),
+        mode='max'
+    )
+
+    # 3. Loss Monitor (Min)
+    es_loss_monitor = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'best_model_loss.pt'),
+        trace_func=lambda s: master_print(f"[ES-Loss] {s}"),
+        mode='min'
+    )
+
+    best_acc = 0.0
+    best_loss = float('inf')
+
+    if is_master:
+        print(f"开始训练流程... (联合早停策略: 等待 Acc/F1/Loss 全部停止改善)")
+        print(f"Warmup {args.warmup_steps} step(s)...")
+    if args.warmup_steps > 0:
+        model.train()
+        loader_wrapper = train_loader
+        if TPU_AVAILABLE and device.type == 'xla':
+            loader_wrapper = pl.ParallelLoader(
+                train_loader, [device]).per_device_loader(device)
+        warmup_iter = iter(loader_wrapper)
+        optimizer.zero_grad()
+        for _ in range(args.warmup_steps):
+            try:
+                x, y, vessel_idx, _, _ = next(warmup_iter)
+            except StopIteration:
+                warmup_iter = iter(loader_wrapper)
+                x, y, vessel_idx, _, _ = next(warmup_iter)
+            x, y = x.to(device), y.to(device)
+            outputs = model(x, vessel_idx)
+            loss = criterion(outputs, y)
+            loss.backward()
             if TPU_AVAILABLE and device.type == 'xla':
-                loader_wrapper = pl.ParallelLoader(
-                    train_loader, [device]).per_device_loader(device)
-            warmup_iter = iter(loader_wrapper)
+                xm.optimizer_step(optimizer, barrier=True)
+                xm.mark_step()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
-            for _ in range(args.warmup_steps):
-                try:
-                    x, y, vessel_idx, _, _, _ = next(warmup_iter)
-                except StopIteration:
-                    warmup_iter = iter(loader_wrapper)
-                    x, y, vessel_idx, _, _, _ = next(warmup_iter)
-                x, y = x.to(device), y.to(device)
-                # Warmup 只跑一次 forward pass 即可，不需要包含完整 loss 计算逻辑
-                # 但为了图构建完整，最好保持和 training step 一致
-                logits, pct_pred = model(x, vessel_idx)
-                # 使用简单的 loss 跑通即可
-                loss = criterion(logits, y)
-                loss.backward()
-                if TPU_AVAILABLE and device.type == 'xla':
-                    xm.optimizer_step(optimizer, barrier=True)
-                    xm.mark_step()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
-            if TPU_AVAILABLE and device.type == 'xla':
-                xm.rendezvous("warmup_done")
+        if TPU_AVAILABLE and device.type == 'xla':
+            xm.rendezvous("warmup_done")
 
-        # Epoch Loop
-        for epoch in range(args.epochs):
-            t0 = time.time()
-            if is_tpu:
-                train_sampler.set_epoch(epoch)
+    for epoch in range(args.epochs):
+        t0 = time.time()
 
-            train_loss, train_acc = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler,
-                mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
-                ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
-
-            if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
-                swa_scheduler.step()
-            else:
-                scheduler.step()
-            current_lr = scheduler.get_last_lr()[0]
-
-            eval_model = ema_model if (ema_model is not None) else model
-            val_metrics = validate(eval_model, val_loader, device,
-                                   criterion, num_classes=args.num_classes)
-
-            dt = time.time() - t0
-
-            if is_master:
-                log_msg = (
-                    f"Fold {fold_idx+1} Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
-                    f"Train: L={train_loss:.4f} A={train_acc:.4f} | "
-                    f"Val: L={val_metrics['loss']:.4f} A={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
-                )
-                print(log_msg)
-                if logger is not None:
-                    logger.info(log_msg)
-
-                if val_metrics['acc'] > best_acc:
-                    best_acc = val_metrics['acc']
-
-                if val_metrics['loss'] < best_loss:
-                    best_loss = val_metrics['loss']
-
-            es_acc(val_metrics['acc'], eval_model)
-            es_f1_monitor(val_metrics['f1'], eval_model)
-            es_loss_monitor(val_metrics['loss'], eval_model)
-
-            stop_flag = False
-            if es_acc.early_stop and es_f1_monitor.early_stop and es_loss_monitor.early_stop:
-                stop_flag = True
-
-            if is_tpu:
-                flag_tensor = torch.tensor(
-                    1 if stop_flag else 0, dtype=torch.int, device=device)
-                xm.all_reduce('max', [flag_tensor])
-                stop_flag = (flag_tensor.item() > 0)
-
-            if stop_flag:
-                if is_master:
-                    print("Early stopping triggered for this fold!")
-                break
-
-        # SWA Saving
-        if args.use_swa and (swa_model is not None):
-            if is_master:
-                print("\n开始更新 SWA BN 统计...")
-            if not is_tpu:
-                update_bn(train_loader, swa_model, device=device)
-            if is_master:
-                swa_path = os.path.join(
-                    args.output_dir, f"swa_model_fold_{fold_idx}.pt")
-                state_dict = swa_model.module.state_dict() if isinstance(
-                    swa_model, nn.DataParallel) else swa_model.state_dict()
-                torch.save(state_dict, swa_path)
-                print(f"SWA 模型已保存至: {swa_path}")
-
-        # Fold Inference
-        if test_loader:
-            if is_master:
-                print(f"\n开始 Fold {fold_idx+1} 测试集预测...")
-
-            # 预测 Best ACC 模型
-            best_acc_path = os.path.join(
-                args.output_dir, f"best_model_fold_{fold_idx}.pt")
-            if os.path.exists(best_acc_path):
-                run_inference(best_acc_path, f"test_predictions_acc_fold_{fold_idx}.csv",
-                              test_loader, model, device, args)
-
-            # 预测 Best F1 模型
-            best_f1_path = os.path.join(
-                args.output_dir, f"best_model_f1_fold_{fold_idx}.pt")
-            if os.path.exists(best_f1_path):
-                run_inference(best_f1_path, f"test_predictions_f1_fold_{fold_idx}.csv",
-                              test_loader, model, device, args)
-
-        # 清理内存
-        del model, optimizer, scheduler, train_loader, val_loader
-        torch.cuda.empty_cache()
         if is_tpu:
-            xm.mark_step()
+            train_sampler.set_epoch(epoch)
 
-    # 所有 Folds 结束后的 Ensemble (仅 Master 执行)
-    if is_master and test_df is not None and not test_df.empty:
-        print("\n" + "="*40)
-        print("开始合并 K-Fold 预测结果...")
-        print("="*40)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, criterion, device, scaler,
+            mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
+            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
 
-        # 针对 Acc 和 F1 分别做 ensemble
-        for metric_name in ['test_predictions_acc', 'test_predictions_f1']:
-            all_preds = []
-            valid_folds = 0
+        if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
+            swa_scheduler.step()
+        else:
+            scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
-            # 读取所有 folds
-            for f_idx in range(args.n_folds):
-                f_name = f"{metric_name}_fold_{f_idx}.csv"
-                f_path = os.path.join(args.output_dir, f_name)
+        eval_model = ema_model if (ema_model is not None) else model
+        val_metrics = validate(eval_model, val_loader, device,
+                               criterion, num_classes=args.num_classes)
 
-                if os.path.exists(f_path):
-                    df_pred = pd.read_csv(f_path)
-                    # 假设 CSV 包含: ID, Prediction, prob_0, prob_1...
-                    prob_cols = [
-                        c for c in df_pred.columns if c.startswith('prob_')]
-                    prob_cols.sort()  # 确保 prob_0, prob_1 ... 顺序
+        dt = time.time() - t0
 
-                    if not prob_cols:
-                        continue
+        if is_master:
+            log_msg = (
+                f"Epoch {epoch+1:02d} ({dt:.1f}s) lr={current_lr:.2e} | "
+                f"Train: Loss={train_loss:.4f} Acc={train_acc:.4f} | "
+                f"Val: Loss={val_metrics['loss']:.4f} Acc={val_metrics['acc']:.4f} F1={val_metrics['f1']:.4f}"
+            )
+            print(log_msg)
+            if logger is not None:
+                logger.info(log_msg)
 
-                    # 按 ID 排序确保对齐
-                    df_pred = df_pred.sort_values('ID').reset_index(drop=True)
-                    all_preds.append(df_pred[prob_cols].values)
-                    valid_folds += 1
+            if val_metrics['acc'] > best_acc:
+                best_acc = val_metrics['acc']
+                # 注: 具体的保存逻辑已移交给 es_acc_monitor，此处仅做记录或日志打印
+                # (之前的 print 和 save 逻辑已由 EarlyStopping 接管)
+                if is_master:
+                    print(f"  >>> [Acc] new high: {best_acc:.4f}")
 
-            if valid_folds > 0:
-                # 平均概率
-                avg_probs = np.mean(all_preds, axis=0)  # [N, 6]
-                final_preds = np.argmax(avg_probs, axis=1)  # [N]
+            if val_metrics['loss'] < best_loss:
+                best_loss = val_metrics['loss']
+                # 注: 具体的保存逻辑已移交给 es_loss_monitor
 
-                # 读取 ID
-                sample_df = pd.read_csv(os.path.join(
-                    args.output_dir, f"{metric_name}_fold_0.csv")).sort_values('ID')
-                ids = sample_df['ID'].values
+        # 更新三个早停监控器
+        es_acc(val_metrics['acc'], eval_model)
+        es_f1_monitor(val_metrics['f1'], eval_model)
+        es_loss_monitor(val_metrics['loss'], eval_model)
 
-                # 构建最终 DataFrame
-                ensemble_res = []
-                for i, rid in enumerate(ids):
-                    row = {'ID': rid, 'Prediction': final_preds[i]}
-                    # 也可以保存 ensemble 后的概率
-                    # for c, p in enumerate(avg_probs[i]):
-                    #     row[f'prob_{c}'] = p
-                    ensemble_res.append(row)
+        # 联合早停检查：只有当三个都触发 Early Stop 时才真正停止
+        stop_flag = False
+        if es_acc.early_stop and es_f1_monitor.early_stop and es_loss_monitor.early_stop:
+            stop_flag = True
 
-                ens_out = os.path.join(
-                    args.output_dir, f"ensemble_{metric_name}.csv")
-                pd.DataFrame(ensemble_res).to_csv(ens_out, index=False)
-                print(f"[{metric_name}] Ensemble 结果已保存至: {ens_out}")
-            else:
-                print(f"[{metric_name}] 未找到足够的 Fold 预测文件，跳过 Ensemble")
+        if is_tpu:
+            flag_tensor = torch.tensor(
+                1 if stop_flag else 0, dtype=torch.int, device=device)
+            xm.all_reduce('max', [flag_tensor])
+            stop_flag = (flag_tensor.item() > 0)
+
+        if stop_flag:
+            if is_master:
+                print("Early stopping triggered!")
+            break
+
+    if args.use_swa and (swa_model is not None):
+        if is_master:
+            print("\n开始更新 SWA BN 统计...")
+        if not is_tpu:
+            update_bn(train_loader, swa_model, device=device)
+        else:
+            if is_master:
+                print("TPU 环境下跳过 SWA 的 BN 更新")
+
+        if is_master:
+            swa_path = os.path.join(args.output_dir, "swa_model.pt")
+            state_dict = swa_model.module.state_dict() if isinstance(
+                swa_model, nn.DataParallel) else swa_model.state_dict()
+            torch.save(state_dict, swa_path)
+            print(f"SWA 模型已保存至: {swa_path}")
+
+    if test_loader:
+        if is_master:
+            print("\n开始测试集预测...")
+
+        best_acc_path = os.path.join(args.output_dir, "best_model.pt")
+        if os.path.exists(best_acc_path):
+            run_inference(best_acc_path, "test_predictions_acc.csv",
+                          test_loader, model, device, args)
+
+        best_f1_path = os.path.join(args.output_dir, "best_model_f1.pt")
+        if os.path.exists(best_f1_path):
+            run_inference(best_f1_path, "test_predictions_f1.csv",
+                          test_loader, model, device, args)
+
+        best_loss_path = os.path.join(args.output_dir, "best_model_loss.pt")
+        if os.path.exists(best_loss_path):
+            run_inference(best_loss_path, "test_predictions_loss.csv",
+                          test_loader, model, device, args)
 
 
 def main():
