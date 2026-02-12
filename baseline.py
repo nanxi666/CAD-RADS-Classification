@@ -865,6 +865,16 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             else:
                 outputs = model(x, vessel_idx)
                 loss, logits = compute_loss(outputs, y, pct, mask, lam, idx)
+                (loss / grad_accum_steps).backward()
+                if (step + 1) % grad_accum_steps == 0:
+                    optimizer.step()
+                    _update_ema_swa()
+                    optimizer.zero_grad()
+
+        # 统计指标
+        with torch.no_grad():
+            running_loss += loss.item()
+            _, predicted = logits.max(1)  # Use logits from compute_loss
             total += y.size(0)
 
             if use_mixup:
