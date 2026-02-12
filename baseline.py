@@ -819,7 +819,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     loss_reg = torch.tensor(0.0, device=device)
 
         # Combine
-        total_loss = loss_cls + 5.0 * loss_reg  # 降低权重 10.0 -> 5.0
+        total_loss = loss_cls + 0.5 * loss_reg  # 再次降低权重 5.0 -> 0.5，避免影响分类主任务
 
         return total_loss, logits
 
@@ -999,7 +999,7 @@ def validate(model, loader, device, criterion, num_classes=6):
                     loss_reg = torch.tensor(0.0, device=device)
 
             # Combine loss
-            loss = loss_cls + 5.0 * loss_reg  # 保持与 Train 一致
+            loss = loss_cls + 0.5 * loss_reg  # 保持与 Train 一致 (5.0 -> 0.5)
 
             running_loss += loss.item()  # total loss
 
