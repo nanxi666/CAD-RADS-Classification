@@ -418,29 +418,31 @@ class DabangDataset(Dataset):
             # 1. 标签处理
             label = -1
             pct = 0.0
+            has_pct = False  # 标记是否有有效的百分比数据
+
             if not self.is_test:
-                # 优先直接使用分类标签，缺失时通过百分比转换
+                # 优先直接使用分类标签
                 if pd.notna(row.get('stenosis_class')):
                     label = int(row['stenosis_class'])
 
-                # 获取百分比用于回归
+                # 获取百分比用于回归，并判断其有效性
                 try:
-                    pct_raw = row.get('stenosis_percentage', 0.0)
-                    if pd.isna(pct_raw):
+                    pct_raw = row.get('stenosis_percentage')
+                    if pd.isna(pct_raw) or str(pct_raw).strip() == '':
                         pct = 0.0
+                        has_pct = False
                     else:
                         pct = float(pct_raw)
+                        has_pct = True
                 except (ValueError, TypeError):
                     pct = 0.0
+                    has_pct = False
 
                 if label == -1:  # 如果上面没拿到class，尝试从pct转换
-                    # 注意：get() 可能获取到 None 或 NaN
-                    stenosis_val = row.get('stenosis_percentage')
-                    if pd.notna(stenosis_val):
-                        # 这里复用上面 robust parse 得到的 pct
+                    if has_pct:
                         label = pct_to_class_6(pct)
                     else:
-                        label = 0
+                        label = 0  # 既无分类也无百分比，仅作为兜底，实际上这类数据可能应剔除
 
             # 2. 图像查找
             img_files = find_multiview_images(self.image_root, rid)
@@ -459,7 +461,9 @@ class DabangDataset(Dataset):
             pid = str(row.get('pid', rid)).strip()
             vessel_code = str(row.get('vessel_code', '')).upper().strip()
             vessel_idx = self.vessel_map.get(vessel_code, 0)
-            samples.append((paths, label, vessel_idx, rid, pid, pct))
+
+            # 存储格式增加 has_pct
+            samples.append((paths, label, vessel_idx, rid, pid, pct, has_pct))
 
         if (not TPU_AVAILABLE) or (TPU_AVAILABLE and xr.global_ordinal() == 0):
             print(f"索引构建完成，有效样本数: {len(samples)}")
@@ -469,7 +473,7 @@ class DabangDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, label, vessel_idx, rid, pid, pct = self.samples[idx]
+        paths, label, vessel_idx, rid, pid, pct, has_pct = self.samples[idx]
         tensors = []
 
         for p in paths:
@@ -493,10 +497,10 @@ class DabangDataset(Dataset):
         # 将 pct 归一化到 0-1 之间
         pct_norm = pct / 100.0
 
-        return x, label, vessel_idx, rid, pid, torch.tensor(pct_norm, dtype=torch.float32)
+        # 返回 mask (1.0 if valid, 0.0 if not)
+        mask = 1.0 if has_pct else 0.0
 
-# -------------------------------------------------------------------------
-# 模型定义
+        return x, label, vessel_idx, rid, pid, torch.tensor(pct_norm, dtype=torch.float32), torch.tensor(mask, dtype=torch.float32)
 # -------------------------------------------------------------------------
 
 
@@ -743,8 +747,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
     correct = 0
     total = 0
 
-    # 辅助 Loss
-    reg_criterion = nn.MSELoss()
+    # 辅助 Loss: MSE, reduction='none' 以便应用 mask
+    reg_criterion = nn.MSELoss(reduction='none')
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
@@ -769,7 +773,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         if (swa_model is not None) and (epoch >= swa_start):
             swa_model.update_parameters(model)
 
-    def compute_loss(outs, target_y, target_pct, lam_val=None, idx_val=None):
+    def compute_loss(outs, target_y, target_pct, mask, lam_val=None, idx_val=None):
         # 解包
         if isinstance(outs, tuple):
             logits, reg_out = outs
@@ -785,23 +789,43 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         else:
             loss_cls = criterion(logits, target_y)
 
-        # Regression Loss
+        # Regression Loss (Masked)
         loss_reg = torch.tensor(0.0, device=device)
         if reg_out is not None:
             if lam_val is not None:
-                # Mix regression targets
-                loss_reg = lam_val * reg_criterion(reg_out, target_pct) + \
-                    (1 - lam_val) * reg_criterion(reg_out, target_pct[idx_val])
+                # Mixup case
+                mse_a = reg_criterion(reg_out, target_pct)  # [B]
+                mse_b = reg_criterion(reg_out, target_pct[idx_val])  # [B]
+
+                loss_batch = lam_val * mse_a * mask + \
+                    (1 - lam_val) * mse_b * mask[idx_val]
+
+                # 计算有效权重的总和
+                valid_weight = lam_val * mask + (1 - lam_val) * mask[idx_val]
+                valid_sum = valid_weight.sum()
+
+                if valid_sum > 0:
+                    loss_reg = loss_batch.sum() / valid_sum
+                else:
+                    loss_reg = torch.tensor(0.0, device=device)
             else:
-                loss_reg = reg_criterion(reg_out, target_pct)
+                # Normal case
+                mse = reg_criterion(reg_out, target_pct)  # [B]
+                loss_batch = mse * mask
+                valid_sum = mask.sum()
+                if valid_sum > 0:
+                    loss_reg = loss_batch.sum() / valid_sum
+                else:
+                    loss_reg = torch.tensor(0.0, device=device)
 
         # Combine
-        total_loss = loss_cls + 10.0 * loss_reg
+        total_loss = loss_cls + 5.0 * loss_reg  # 降低权重 10.0 -> 5.0
 
         return total_loss, logits
 
-    for step, (x, y, vessel_idx, _, _, pct) in enumerate(iter_loader):
-        x, y, pct = x.to(device), y.to(device), pct.to(device)
+    for step, (x, y, vessel_idx, _, _, pct, mask) in enumerate(iter_loader):
+        x, y, pct, mask = x.to(device), y.to(
+            device), pct.to(device), mask.to(device)
 
         # Mixup处理
         use_mixup = (mixup_alpha > 0)
@@ -810,10 +834,10 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             if use_mixup:
                 x, y_a, y_b, lam, idx = mixup_data(x, y, mixup_alpha, device)
                 outputs = model(x, vessel_idx)
-                loss, logits = compute_loss(outputs, y, pct, lam, idx)
+                loss, logits = compute_loss(outputs, y, pct, mask, lam, idx)
             else:
                 outputs = model(x, vessel_idx)
-                loss, logits = compute_loss(outputs, y, pct)
+                loss, logits = compute_loss(outputs, y, pct, mask)
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -830,7 +854,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     outputs = model(x, vessel_idx)
-                    loss, logits = compute_loss(outputs, y, pct, lam, idx)
+                    loss, logits = compute_loss(
+                        outputs, y, pct, mask, lam, idx)
                 scaler.scale(loss / grad_accum_steps).backward()
                 if (step + 1) % grad_accum_steps == 0:
                     scaler.step(optimizer)
@@ -839,17 +864,7 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     optimizer.zero_grad()
             else:
                 outputs = model(x, vessel_idx)
-                loss, logits = compute_loss(outputs, y, pct, lam, idx)
-                (loss / grad_accum_steps).backward()
-                if (step + 1) % grad_accum_steps == 0:
-                    optimizer.step()
-                    _update_ema_swa()
-                    optimizer.zero_grad()
-
-        # 统计指标
-        with torch.no_grad():
-            running_loss += loss.item()
-            _, predicted = logits.max(1)  # Use logits from compute_loss
+                loss, logits = compute_loss(outputs, y, pct, mask, lam, idx)
             total += y.size(0)
 
             if use_mixup:
@@ -922,12 +937,13 @@ def validate(model, loader, device, criterion, num_classes=6):
     model.eval()
     running_loss = 0.0
     running_mae = 0.0  # Regression MAE
+    mae_count = 0      # Count of valid regression samples
     confusion_matrix = torch.zeros(
         (num_classes, num_classes), dtype=torch.long, device=device)
 
-    # Regression Loss Criterion
-    reg_criterion = nn.MSELoss()
-    mae_criterion = nn.L1Loss()  # For metric
+    # Regression Loss Criterion (Masked logic implemented manually)
+    reg_criterion = nn.MSELoss(reduction='none')
+    mae_criterion = nn.L1Loss(reduction='none')  # For metric
 
     loader_wrapper = loader
     if TPU_AVAILABLE and device.type == 'xla':
@@ -940,8 +956,9 @@ def validate(model, loader, device, criterion, num_classes=6):
                        leave=False) if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, y, vessel_idx, _, _, pct in iter_loader:
-            x, y, pct = x.to(device), y.to(device), pct.to(device)
+        for x, y, vessel_idx, _, _, pct, mask in iter_loader:
+            x, y, pct, mask = x.to(device), y.to(
+                device), pct.to(device), mask.to(device)
             outputs = model(x, vessel_idx)
 
             if isinstance(outputs, tuple):
@@ -955,17 +972,26 @@ def validate(model, loader, device, criterion, num_classes=6):
             loss_cls = criterion(logits, y)
 
             loss_reg = torch.tensor(0.0, device=device)
-            mae = torch.tensor(0.0, device=device)
+
             if reg_out is not None:
-                loss_reg = reg_criterion(reg_out, pct)
-                # Convert back to percentage
-                mae = mae_criterion(reg_out, pct) * 100.0
+                mse = reg_criterion(reg_out, pct)
+                loss_batch = mse * mask
+                valid_sum = mask.sum()
+
+                if valid_sum > 0:
+                    loss_reg = loss_batch.sum() / valid_sum
+
+                    # MAE calculation (Metric)
+                    abs_diff = mae_criterion(reg_out, pct) * 100.0
+                    running_mae += (abs_diff * mask).sum().item()
+                    mae_count += valid_sum.item()
+                else:
+                    loss_reg = torch.tensor(0.0, device=device)
 
             # Combine loss
-            loss = loss_cls + 10.0 * loss_reg
+            loss = loss_cls + 5.0 * loss_reg  # 保持与 Train 一致
 
             running_loss += loss.item()  # total loss
-            running_mae += mae.item()
 
             _, preds = logits.max(1)
             indices = y * num_classes + preds
@@ -977,26 +1003,26 @@ def validate(model, loader, device, criterion, num_classes=6):
             running_loss = torch.tensor(running_loss, device=device)
         if not isinstance(running_mae, torch.Tensor):
             running_mae = torch.tensor(running_mae, device=device)
+        if not isinstance(mae_count, torch.Tensor):
+            mae_count = torch.tensor(mae_count, device=device)
 
-        t_metrics = [running_loss, confusion_matrix, running_mae]
+        t_metrics = [running_loss, confusion_matrix, running_mae, mae_count]
         xm.all_reduce('sum', t_metrics)
 
         global_loss_sum = t_metrics[0].item()
         global_conf_mat = t_metrics[1].cpu().numpy()
         global_mae_sum = t_metrics[2].item()
+        global_mae_count = t_metrics[3].item()
 
-        # NOTE: len(loader) returns total length / world_size if using DistributedSampler?
-        # ParallelLoader usually iterates over local subset.
-        # Just use total_batches = len(loader) calculation from before
         total_batches = len(loader) * xr.world_size()  # Approximately
-
         denom = total_batches if total_batches > 0 else 1
         avg_loss = global_loss_sum / denom
-        avg_mae = global_mae_sum / denom
+
+        avg_mae = global_mae_sum / global_mae_count if global_mae_count > 0 else 0.0
 
     else:
         avg_loss = running_loss / len(loader)
-        avg_mae = running_mae / len(loader)
+        avg_mae = running_mae / mae_count if mae_count > 0 else 0.0
         global_conf_mat = confusion_matrix.cpu().numpy()
 
     # Return everything needed
@@ -1088,7 +1114,7 @@ def run_inference(model_path, output_name, test_loader, model, device, args):
         loader_wrapper, desc=f"Inference ({output_name})") if show_pbar else loader_wrapper
 
     with torch.no_grad():
-        for x, _, vessel_idx, rids, pids, _ in iter_loader:
+        for x, _, vessel_idx, rids, pids, _, _ in iter_loader:
             x = x.to(device)
             outputs = model(x, vessel_idx)
 
@@ -1477,12 +1503,10 @@ def run_worker(rank, args):
         optimizer.zero_grad()
         for _ in range(args.warmup_steps):
             try:
-                x, y, vessel_idx, _, _, pct = next(warmup_iter)
+                x, y, vessel_idx, _, _, pct, mask = next(warmup_iter)
             except StopIteration:
                 warmup_iter = iter(loader_wrapper)
-                x, y, vessel_idx, _, _, pct = next(warmup_iter)
-            x, y = x.to(device), y.to(device)
-            # Warmup: Ignore regression
+                x, y, vessel_idx, _, _, pct, mask = next(warmup_iter)
             outputs = model(x, vessel_idx)
             if isinstance(outputs, tuple):
                 logits, _ = outputs
