@@ -923,21 +923,14 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
         correct = t_metrics[1].item()
         total_sum = t_metrics[2].item()  # 汇总后的总样本数
 
-        # 使用汇总后的 total_sum 来计算平均 ACC
-        # 注意: loader_len 这种估算方式可能不准，不仅要除以 steps，还要除以 world_size
-        # 最稳妥是直接用 reduction 后的 running_loss / steps_per_epoch * world_size?
-        # 简化处理: loss 已经是 sum 了，直接除以 total_sum 得到 per-sample loss，或者维持原有逻辑
-
-        # 修正: running_loss 是 sum of batch losses (means) * steps?
-        # 原始代码: (loss / grad_accum_steps).backward() -> loss是mean
-        # running_loss += loss.item() -> sum of means
-        # 所以 avg_loss = running_loss / steps
-
-        # 简单起见，这里 loss 打印可能略有偏差，主要看 ACC
-        # 如果追求精确，应该记录 loss * batch_size 然后 all_reduce sum
-
+        # 修正 Train Loss 打印异常
+        # running_loss 是所有核的 loss 之和 (Sum of means)
+        # 我们需要除以 (total_steps * world_size) 来得到平均 loss
         total_steps = len(loader)  # per core
-        return running_loss / total_steps, correct / (total_sum if total_sum > 0 else 1)
+        world_size = xr.world_size()
+        avg_loss = running_loss / (total_steps * world_size)
+
+        return avg_loss, correct / (total_sum if total_sum > 0 else 1)
 
     return running_loss / len(loader), correct / total
 
