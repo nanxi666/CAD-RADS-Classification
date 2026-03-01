@@ -1431,6 +1431,9 @@ def run_worker(rank, args):
                 x, y, vessel_idx, _, _, _ = next(warmup_iter)
             x, y = x.to(device), y.to(device)
             outputs = model(x, vessel_idx)
+            # 兼容回归头输出
+            if isinstance(outputs, tuple):
+                outputs, _ = outputs
             loss = criterion(outputs, y)
             loss.backward()
             if TPU_AVAILABLE and device.type == 'xla':
