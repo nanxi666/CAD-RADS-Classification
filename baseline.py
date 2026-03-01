@@ -1425,10 +1425,10 @@ def run_worker(rank, args):
         optimizer.zero_grad()
         for _ in range(args.warmup_steps):
             try:
-                x, y, vessel_idx, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _, _ = next(warmup_iter)
             except StopIteration:
                 warmup_iter = iter(loader_wrapper)
-                x, y, vessel_idx, _, _ = next(warmup_iter)
+                x, y, vessel_idx, _, _, _ = next(warmup_iter)
             x, y = x.to(device), y.to(device)
             outputs = model(x, vessel_idx)
             loss = criterion(outputs, y)
