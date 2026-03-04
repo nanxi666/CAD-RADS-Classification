@@ -709,7 +709,8 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 
 def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_alpha=0.0,
-                grad_accum_steps: int = 1, ema_model=None, swa_model=None, swa_start: int = 0, epoch: int = 0):
+                grad_accum_steps: int = 1, ema_model=None, swa_model=None,
+                swa_start: int = 0, epoch: int = 0, reg_loss_weight: float = 10.0):
     """单轮训练逻辑，支持 MixUp 和 回归辅助任务"""
     model.train()
     mse_criterion = nn.MSELoss()
@@ -785,8 +786,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                     else:
                         loss_reg = mse_criterion(reg_pred, pct_target)
 
-                # 总 Loss (权重 10.0 可调)
-                loss = loss_cls + 10.0 * loss_reg
+                # 总 Loss (回归损失权重可调)
+                loss = loss_cls + reg_loss_weight * loss_reg
 
             scaler.scale(loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -816,7 +817,8 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None, mixup_
                 else:
                     loss_reg = mse_criterion(reg_pred, pct_target)
 
-            loss = loss_cls + 10.0 * loss_reg
+            # 总 Loss (回归损失权重可调)
+            loss = loss_cls + reg_loss_weight * loss_reg
 
             (loss / grad_accum_steps).backward()
             if (step + 1) % grad_accum_steps == 0:
@@ -1167,6 +1169,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='全局随机种子')
     parser.add_argument('--mixup_alpha', type=float,
                         default=0.8, help='MixUp alpha 参数 (0表示禁用)')
+    parser.add_argument('--reg_loss_weight', type=float, default=10.0,
+                        help='回归损失权重 (总损失 = 分类损失 + reg_loss_weight * 回归损失)')
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='梯度累积步数 (用于降低显存占用)')
     parser.add_argument('--warmup_steps', type=int, default=1,
@@ -1454,7 +1458,8 @@ def run_worker(rank, args):
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, scaler,
             mixup_alpha=args.mixup_alpha, grad_accum_steps=args.grad_accum_steps,
-            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start, epoch=epoch)
+            ema_model=ema_model, swa_model=swa_model, swa_start=args.swa_start,
+            epoch=epoch, reg_loss_weight=args.reg_loss_weight)
 
         if args.use_swa and (swa_scheduler is not None) and epoch >= args.swa_start:
             swa_scheduler.step()
